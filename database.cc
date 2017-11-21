@@ -2835,6 +2835,424 @@ struct query_state {
     }
 };
 
+// saveable_mutation_reader works around a lifetime problem with our existing
+// mutation_source API: When a mutation_source is used to create a
+// mutation_reader, two parameters, a partition range and clustering slice,
+// are passed by reference, and the created mutation_reader may (and does)
+// keep these references. Therefore these range and slice objects must be
+// saved, and kept alive, together with the reader object. Normally the
+// creator of the mutation_reader guarantees that they live as long as it
+// wants to use this reader, but in the code below we want to keep this
+// reader longer, in a cache of readers to be reused. We work around this
+// with the following class which holds a mutation_reader and the range and
+// slice used to create it.
+class saveable_mutation_reader final {
+private:
+    // The range and slice fields must be in a unique_ptr so that this object
+    // may be moved without breaking the references that _reader holds to them
+    std::unique_ptr<dht::partition_range> _range;
+    std::unique_ptr<query::partition_slice> _slice;
+    mutation_reader _reader;
+public:
+    saveable_mutation_reader(mutation_source underlying,
+            // these are the same parameters as mutation_source has:
+            schema_ptr s,
+            const dht::partition_range& r,
+            const query::partition_slice& slice,
+            const io_priority_class& pc,
+            tracing::trace_state_ptr trace_state,
+            streamed_mutation::forwarding fwd,
+            mutation_reader::forwarding fwd_mr)
+        : _range(std::make_unique<dht::partition_range>(r))
+        , _slice(std::make_unique<query::partition_slice>(slice))
+        , _reader(underlying(s, *_range, *_slice, pc, std::move(trace_state), fwd, fwd_mr))
+    {}
+    future<streamed_mutation_opt> operator()() {
+        return _reader();
+    }
+    future<> fast_forward_to(const dht::partition_range& pr) {
+        _range = std::make_unique<dht::partition_range>(pr);
+        return _reader.fast_forward_to(*_range);
+    }
+};
+
+#ifdef DEBUG
+// define this if mutation reader cache should maintain, and verify,
+// the last seen clustering key.
+#define VERIFY_LAST_CLUSTERING_KEY
+#endif
+
+// When we try below to save a partially consumed streamed_mutation for later
+// reuse, we find ourselves in a problem: We are forced to wrap the
+// streamed_mutation (to ignore the user's destruction of this wrapper) and
+// the virtual functions of streamed_mutation::impl only allow us to retrieve
+// a whole buffer of fragments from the internal streamed_mutation - and there
+// is no way to return back the unused fragments to the internal
+// streamed_mutation. So in addition to the internal streamed_mutation (_sm)
+// we need to save a separate buffer of saved fragments, and insert them into
+// a new wrapper when one will be created. Similarly for the "end_of_stream"
+// flag.
+class saveable_streamed_mutation final {
+    optimized_optional<streamed_mutation> _sm;
+public:
+    circular_buffer<mutation_fragment> _buffer;
+    bool _end_of_stream;
+#ifdef VERIFY_LAST_CLUSTERING_KEY
+    std::experimental::optional<clustering_key> _last_clustering_key;
+#endif
+public:
+    saveable_streamed_mutation(streamed_mutation sm)
+        : _sm(std::move(sm)), _buffer(), _end_of_stream(false) {}
+    saveable_streamed_mutation()
+        : _sm(), _buffer(), _end_of_stream(false) {}
+    // Emulate streamed_mutation's API:
+    const partition_key& key() const { return _sm->key(); }
+    const dht::decorated_key& decorated_key() const { return _sm->decorated_key(); }
+    const schema_ptr& schema() const { return _sm->schema(); }
+    tombstone partition_tombstone() const { return _sm->partition_tombstone(); }
+    bool is_end_of_stream() const { return _sm->is_end_of_stream(); }
+    future<> fill_buffer() { return _sm->fill_buffer(); }
+    bool is_buffer_empty() const { return _sm->is_buffer_empty(); }
+    mutation_fragment pop_mutation_fragment() { return _sm->pop_mutation_fragment(); }
+    future<> fast_forward_to(position_range pr) { return _sm->fast_forward_to(std::move(pr)); }
+    // Emulate optimized_optional's API:
+    operator bool() { return bool(_sm); }
+};
+
+class saved_reader {
+public:
+    // The saved reader itself
+    saveable_mutation_reader _reader;
+    // When we stopped reading in the middle (or end) of a partition, _reader
+    // will not produce the same partition again. Rather, we need to save the
+    // actual streamed_mutation object already returned (which has already
+    // been partially consumed by the user) to return it again when the read
+    // is resumed.
+    // _last_mutation can also tell us the last read position (partition and
+    // clustering key which we can use (for debugging) to verify the reader
+    // is in the position which the query needs.
+    lw_shared_ptr<saveable_streamed_mutation> _last_mutation;
+    // TODO: mutation_reader implementations normally know their own schema,
+    // so it would be nice to add a mutation_reader::schema() virtual
+    // function, so we wouldn't need to add this field.
+    schema_ptr _s;
+};
+
+static thread_local std::unordered_map<utils::UUID, saved_reader> saved_reader_cache;
+
+
+// A streamed_mutation_wrapper is a wrapper for a streamed_mutation, which
+// holds a shared pointer to a mutation and thus when its user destroys
+// the wrapper object the internal streamed_mutation is *not* destroyed,
+// and rather can be reused by wrapping it in a new streamed_mutation_wrapper.
+class streamed_mutation_wrapper final : public streamed_mutation::impl {
+    lw_shared_ptr<saveable_streamed_mutation> _state;
+#ifdef VERIFY_LAST_CLUSTERING_KEY
+    std::vector<std::experimental::optional<clustering_key>> _clustering_keys;
+#endif
+public:
+    streamed_mutation_wrapper(lw_shared_ptr<saveable_streamed_mutation> state)
+        : impl(state->schema(), state->decorated_key(),
+          state->partition_tombstone()), _state(state)
+    {
+        // Move the information that a previous destruction of this wrapper
+        // had to store outside the streamed_mutation, into the new wrapper.
+        while (!_state->_buffer.empty()) {
+#ifdef VERIFY_LAST_CLUSTERING_KEY
+            auto &mf = _state->_buffer.front();
+            if (mf.has_key()) {
+                _clustering_keys.push_back(mf.key());
+            } else {
+                _clustering_keys.push_back(std::experimental::optional<clustering_key>());
+            }
+#endif
+            push_mutation_fragment(std::move(_state->_buffer.front()));
+            _state->_buffer.pop_front();
+        }
+        _end_of_stream = _state->_end_of_stream;
+    };
+    virtual ~streamed_mutation_wrapper() {
+        // This wrapper contains already read fragments which unfortunately
+        // there is no way to return to the streamed_mutation, so we hold
+        // them separately in _state. They will be restored into a new wrapper
+        // when one is created (see constructor above).
+        _state->_end_of_stream = is_end_of_stream();
+#ifdef VERIFY_LAST_CLUSTERING_KEY
+        unsigned n = 0;
+#endif
+        while (!is_buffer_empty()) {
+            _state->_buffer.emplace_back(pop_mutation_fragment());
+#ifdef VERIFY_LAST_CLUSTERING_KEY
+            n++;
+#endif
+        }
+#ifdef VERIFY_LAST_CLUSTERING_KEY
+        // After fill_buffer() the clustering keys list was _clustering_keys.
+        // Now, we have n left. If n == _clustering_keys.size(), no clustering
+        // key was read. Otherwise, the last key read is the n'th from the
+        // last one on the list.
+        if (n >= _clustering_keys.size()) {
+            _state->_last_clustering_key = {};
+        } else {
+            _state->_last_clustering_key = _clustering_keys[_clustering_keys.size() - n - 1];
+        }
+#endif
+
+    }
+    virtual future<> fill_buffer() override {
+        return _state->fill_buffer().then([this] {
+            // fill_buffer() is not just about saying when the buffer is full,
+            // it's also about actually putting content in the buffer and
+            // setting the variable _end_of_stream when there's no more.
+#ifdef VERIFY_LAST_CLUSTERING_KEY
+            _clustering_keys.clear();
+#endif
+            while (!_state->is_buffer_empty()) {
+#ifdef VERIFY_LAST_CLUSTERING_KEY
+                auto mf = _state->pop_mutation_fragment();
+                if (mf.has_key()) {
+                    _clustering_keys.push_back(mf.key());
+                } else {
+                    _clustering_keys.push_back(std::experimental::optional<clustering_key>());
+                }
+                push_mutation_fragment(std::move(mf));
+#else
+                push_mutation_fragment(_state->pop_mutation_fragment());
+#endif
+            }
+            _end_of_stream = _state->is_end_of_stream();
+        });
+    }
+    virtual future<> fast_forward_to(position_range pr) override {
+        _end_of_stream = false;
+        forward_buffer_to(pr.start());
+        return _state->fast_forward_to(std::move(pr));
+    }
+};
+
+// A recache_mutation_reader is a wrapper for a mutation_reader, which when
+// the wrapper object is destroyed (normally at the end of the query using
+// it), the held reader is returned to a cache, to be reused later.
+class recache_mutation_reader final : public mutation_reader::impl {
+    schema_ptr _s;
+    saveable_mutation_reader _rd;
+    // _first_mutation is the streamed_mutation to be returned first,
+    // because it contains the unread rest of a streamed_mutation returned
+    // by the previous incarnation of this reader..
+    saveable_streamed_mutation _first_mutation;
+    // We hold _last_mutation in a shared_ptr because it is used independently
+    // by cache (moved between between recache_mutation_reader and
+    // saved_reader) and its direct user.
+    lw_shared_ptr<saveable_streamed_mutation> _last_mutation;
+    std::unordered_map<utils::UUID, saved_reader>& _cache;
+    utils::UUID _reader_save_uuid;
+    bool _exhausted;
+public:
+    recache_mutation_reader(schema_ptr s, saveable_mutation_reader rd,
+            std::unordered_map<utils::UUID, saved_reader>& cache,
+            utils::UUID save_uuid, saveable_streamed_mutation first_mutation)
+        : _s(std::move(s))
+        , _rd(std::move(rd))
+        , _first_mutation(std::move(first_mutation))
+        , _last_mutation(make_lw_shared<saveable_streamed_mutation>())
+        , _cache(cache)
+        , _reader_save_uuid(save_uuid)
+        , _exhausted(false)
+    {
+        // the default-constructed uuid is a sign not to cache the reader, so
+        // this wrapper would not be used in that case.
+        assert(_reader_save_uuid != utils::UUID());
+    }
+
+    virtual future<streamed_mutation_opt> operator()() override {
+        // To allow us to save the returned mutation stream *after* our caller
+        // destroys it, we need to wrap the streamed mutation we read from _rd,
+        // and hold the actual streamed mutation in _last_mutation.
+        if (_first_mutation) {
+            dblog.trace("recache_mutation_reader.operator() resuming mutation");
+            *_last_mutation = std::move(_first_mutation);
+            return make_ready_future<streamed_mutation_opt>(
+                    make_streamed_mutation<streamed_mutation_wrapper>(_last_mutation));
+        } else {
+            dblog.trace("recache_mutation_reader.operator() new mutation");
+            return _rd().then([this] (streamed_mutation_opt sm) {
+                if (sm) {
+                    *_last_mutation = saveable_streamed_mutation(std::move(*sm));
+                    return streamed_mutation_opt(make_streamed_mutation<streamed_mutation_wrapper>(_last_mutation));
+                } else {
+                    _exhausted = true;
+                    // We leave _last_mutation unchanged here.
+                    return sm;
+                }
+            });
+        }
+    }
+    virtual future<> fast_forward_to(const dht::partition_range& pr) override {
+        *_last_mutation = {};
+        _exhausted = false;
+        return _rd.fast_forward_to(pr);
+    }
+    virtual ~recache_mutation_reader() {
+        if (_exhausted) {
+            dblog.trace("recache_mutation_reader dropping exhausted reader");
+            return;
+        }
+        if (_reader_save_uuid == utils::UUID()) {
+            return;
+        }
+        // If a reader is already saved with this UUID, replace it.
+        auto it = _cache.find(_reader_save_uuid);
+        saved_reader rd{std::move(_rd), std::move(_last_mutation), std::move(_s)};
+        if (it == _cache.end()) {
+            _cache.emplace(_reader_save_uuid, std::move(rd));
+        } else {
+            dblog.trace("recache_mutation_reader dropping overridden reader");
+            it->second = std::move(rd);
+        }
+    }
+};
+
+static bool
+check_saved_reader(saved_reader& sr, const schema_ptr& s,
+        const dht::partition_range& r, const query::partition_slice& slice) {
+    dblog.trace("check_saved_reader r is: {}", r);
+    dblog.trace("check_saved_reader slice is: {}", slice);
+    // Check for the expected schema:
+    if (sr._s != s) {
+        dblog.warn("check_saved_reader mismatched: wrong schema");
+        return false;
+    }
+    // In paging, after the first page the range always starts in a partition
+    // key. If we see something else, this cannot be paging. For example
+    // querying a cluster generates separate queries for the separate vnodes,
+    // but they all share the same paging state - but we note that each vnode
+    // range starts with a non-inclusive range that only has a token (not a key)
+    // and a reader from the previous vnode will not be reused.
+    if (!r.start() || !r.start()->value().has_key()) {
+        dblog.trace("check_saved_reader mismatched: non-partition range start");
+        return false;
+    }
+    // When partitions have clustering rows, the range is normally inclusive:
+    // Even if the last read finished all the partition's rows, the reader
+    // doesn't know that, and wants to try reading more from the last
+    // partition (and it will get nothing). But, when there is no clustering
+    // key and each partition is a single row, the reader knows it finished an
+    // entire partition, and gives us a range with a non-inclusive start.
+    // In that case, the saved _last_mutation (if there is any) is irrelevant.
+    if (!r.start()->is_inclusive()) {
+        *sr._last_mutation = {};
+        // FIXME: If we're here, we didn't verify that we're continuing at the
+        // right partition because we don't have _last_mutation->key(). Such
+        // verification is not necessary but it's nice for debugging and we do
+        // it below in other case.
+    } else if (!sr._last_mutation || !*sr._last_mutation) {
+        // If the range includes the last mutation, we need to know what it is!
+        dblog.warn("check_saved_reader mismatched: unexpected: missing _last_mutation");
+        return false;
+    } else {
+        // Check that the reader is at the expected partition key.
+        // This check is not strictly necessary - the caller should not have
+        // reused the reader's UUID if it's not sure it is at the right
+        // position - but since we have this information for free (but
+        // just at the partition level), we might as well check it...
+        // Tracking the last clustering key is not free, so we have it
+        // below in an ifdef.
+        if (!r.start()->value().key()->equal(*s, sr._last_mutation->key())) {
+            dblog.warn("check_saved_reader mismatched: not starting at the same partition as saved reader");
+            return false;
+        }
+#ifdef VERIFY_LAST_CLUSTERING_KEY
+        // If we stopped at a known last partition key and last clustering key
+        // we expect to see in "slice" a specific range asking for the slice
+        // starting at this clustering key:
+        auto& specific = slice.get_specific_ranges();
+        if (!specific) {
+            dblog.warn("check_saved_reader mismatched: missing specific range in slice");
+            return false;
+        }
+        if (!specific->pk().equal(*s, sr._last_mutation->key())) {
+            dblog.warn("check_saved_reader mismatched: wrong partition key on specific range");
+            return false;
+        }
+        auto &ranges = specific->ranges();
+        if (ranges.size() != 1) {
+            dblog.warn("check_saved_reader mismatched: expected one range in specific range");
+            return false;
+        }
+        auto start = ranges[0].start();
+        if (!start || start->is_inclusive()) {
+            dblog.warn("check_saved_reader mismatched: expected specific range to start with exclusive bound");
+            return false;
+        }
+        if (!sr._last_mutation->_last_clustering_key) {
+            dblog.warn("check_saved_reader mismatched: missing last clustering key");
+            return false;
+        }
+        clustering_key::equality ck_eq(*s);
+        if (!ck_eq(*sr._last_mutation->_last_clustering_key, start->value())) {
+            dblog.warn("check_saved_reader mismatched: wrong last clustering key {} vs {}", *sr._last_mutation->_last_clustering_key, start->value());
+            return false;
+        }
+#endif
+    }
+    dblog.trace("check_saved_reader matched");
+    return true;
+}
+
+// A caching_mutation_source wraps another mutation_source (e.g.,
+// cf.as_mutation_source()) allowing reuse of readers in paged queries.
+// It looks for a suitable reader in the cache, only creating a new one
+// (via the underlying mutation_source) if not found in the cache.
+// Eventually, when the user stops using the reader, it is saved in the
+// cache instead of being destroyed immediately.
+// A reader is searched under the key "reader_recall_uuid", but when
+// eventually returned to the cache, it is saved under "reader_save_uuid".
+static mutation_source
+caching_mutation_source(mutation_source underlying,
+        std::unordered_map<utils::UUID, saved_reader>& cache,
+        utils::UUID reader_recall_uuid, bool reader_recall_drop,
+        utils::UUID reader_save_uuid) {
+    return mutation_source([underlying = std::move(underlying), &cache, reader_recall_uuid, reader_recall_drop, reader_save_uuid] (
+            schema_ptr s,
+            const dht::partition_range& r,
+            const query::partition_slice& slice,
+            const io_priority_class& pc,
+            tracing::trace_state_ptr trace_state,
+            streamed_mutation::forwarding fwd,
+            mutation_reader::forwarding fwd_mr) {
+        auto it = cache.find(reader_recall_uuid);
+        if (it != cache.end()) {
+            // Found saved reader. Remove it from the cache unconditionally,
+            // it will not be re-inserted under the same key to prevent
+            // accidental reuse of the same reader, which will no longer be
+            // at the same position it was.
+            saved_reader sr = std::move(it->second);
+            cache.erase(it);
+            // TODO: need to also check that pc, trace_state, fwd, fwd_mr,
+            // didn't change?
+            if (reader_recall_drop) {
+                dblog.trace("Dropping saved reader for paged query {}, as requested", reader_recall_uuid);
+            } else if (check_saved_reader(sr, s, r, slice)) {
+                dblog.trace("Reusing saved reader for paged query, uid {} -> {}", reader_recall_uuid, reader_save_uuid);
+                return make_mutation_reader<recache_mutation_reader>(s, std::move(sr._reader), cache, reader_save_uuid, std::move(*sr._last_mutation));
+            } else {
+                dblog.trace("Dropped mismatched saved reader for paged query {}", reader_recall_uuid);
+            }
+        }
+        if (reader_save_uuid != utils::UUID()) {
+            dblog.trace("Creating new reader for paged query, uid {}", reader_save_uuid);
+            // Note that to ensure the lifetime of "r" and "slice" we need to
+            // use saveable_mutation_reader instead of calling underlying()
+            // directly, as explained above.
+            saveable_mutation_reader ret(underlying, s, r, slice, pc, std::move(trace_state), fwd, fwd_mr);
+            return make_mutation_reader<recache_mutation_reader>(s, std::move(ret), cache, reader_save_uuid, saveable_streamed_mutation());
+        } else {
+            // The empty uuid means we shouldn't cache this reader.
+            return underlying(s, r, slice, pc, std::move(trace_state), fwd, fwd_mr);
+        }
+    });
+}
+
 future<lw_shared_ptr<query::result>>
 column_family::query(schema_ptr s, const query::read_command& cmd, query::result_request request,
                      const dht::partition_range_vector& partition_ranges,
@@ -2849,7 +3267,15 @@ column_family::query(schema_ptr s, const query::read_command& cmd, query::result
         auto& qs = *qs_ptr;
         return do_until(std::bind(&query_state::done, &qs), [this, &qs, trace_state = std::move(trace_state)] {
             auto&& range = *qs.current_partition_range++;
-            return data_query(qs.schema, as_mutation_source(), range, qs.cmd.slice, qs.remaining_rows(),
+            auto ms = as_mutation_source();
+            if (qs.cmd.reader_save_uuid != utils::UUID() ||
+                    qs.cmd.reader_recall_uuid != utils::UUID()) {
+                // Wrap the mutation source to look for a cached reader
+                // before creating a new one, and to save the reader when
+                // the mutation source is destructed at the end of the query.
+                ms = caching_mutation_source(std::move(ms), saved_reader_cache, qs.cmd.reader_recall_uuid, qs.cmd.reader_recall_drop, qs.cmd.reader_save_uuid);
+            }
+            return data_query(qs.schema, std::move(ms), range, qs.cmd.slice, qs.remaining_rows(),
                               qs.remaining_partitions(), qs.cmd.timestamp, qs.builder, trace_state);
         }).then([qs_ptr = std::move(qs_ptr), &qs] {
             return make_ready_future<lw_shared_ptr<query::result>>(
@@ -2901,7 +3327,14 @@ future<reconcilable_result, cache_temperature>
 database::query_mutations(schema_ptr s, const query::read_command& cmd, const dht::partition_range& range,
                           query::result_memory_accounter&& accounter, tracing::trace_state_ptr trace_state) {
     column_family& cf = find_column_family(cmd.cf_id);
-    return mutation_query(std::move(s), cf.as_mutation_source(), range, cmd.slice, cmd.row_limit, cmd.partition_limit,
+    mutation_source ms = cf.as_mutation_source();
+    if (cmd.reader_save_uuid != utils::UUID() || cmd.reader_recall_uuid != utils::UUID()) {
+        // wrap the mutation source to look for a cached reader before
+        // creating a new one, and/or save the reader when the mutation
+        // source is destructed at the end of the query.
+        ms = caching_mutation_source(std::move(ms), saved_reader_cache, cmd.reader_recall_uuid, cmd.reader_recall_drop, cmd.reader_save_uuid);
+    }
+    return mutation_query(std::move(s), std::move(ms), range, cmd.slice, cmd.row_limit, cmd.partition_limit,
             cmd.timestamp, std::move(accounter), std::move(trace_state)).then_wrapped([this, s = _stats, hit_rate = cf.get_global_cache_hit_rate()] (auto f) {
         if (f.failed()) {
             ++s->total_reads_failed;

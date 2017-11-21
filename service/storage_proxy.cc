@@ -3761,6 +3761,18 @@ void storage_proxy::init_messaging_service() {
         });
     });
     ms.register_read_mutation_data([] (const rpc::client_info& cinfo, query::read_command cmd, compat::wrapping_partition_range pr) {
+        // This verb is only used in reconciliation: We (a replica) were
+        // previously asked to return the data or digest of some range and
+        // saved the reader, but the coordinator saw a mismatch and has now
+        // sent us another request for the same range - this time as a
+        // read_mutation_data verb. Not only can't we resume the reader saved
+        // in the previous request, we should drop it so it won't be reused
+        // in the next page request (reconciliation is unlikely to produce
+        // exactly the amount of rows desired in the read_command).
+        cmd.reader_recall_drop = true;
+        cmd.reader_recall_uuid = cmd.reader_save_uuid;
+        cmd.reader_save_uuid = utils::UUID();
+
         tracing::trace_state_ptr trace_state_ptr;
         auto src_addr = netw::messaging_service::get_source(cinfo);
         if (cmd.trace_info) {
