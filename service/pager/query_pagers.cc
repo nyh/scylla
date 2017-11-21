@@ -72,12 +72,18 @@ private:
 
     future<> fetch_page(cql3::selection::result_set_builder& builder, uint32_t page_size, gc_clock::time_point now) override {
         auto state = _options.get_paging_state();
-
         if (!_last_pkey && state) {
             _max = state->get_remaining();
             _last_pkey = state->get_partition_key();
             _last_ckey = state->get_clustering_key();
+            _cmd->reader_recall_uuid = state->get_reader_recall_uuid();
+            // NYH FIXME: need to also get the "last replicas" from the state, and prefer those instead of random replicas.
+            // need to save the list in a separate variable, and pass it to query() call below (don't put it in _cmd).
+        } else {
+            _cmd->reader_recall_uuid = utils::UUID();
         }
+        _cmd->reader_save_uuid = utils::make_random_uuid();
+        qlogger.trace("fetch_page recall {} save {}", _cmd->reader_recall_uuid, _cmd->reader_save_uuid);
 
         if (_last_pkey) {
             auto dpk = dht::global_partitioner().decorate_key(*_schema, *_last_pkey);
@@ -303,7 +309,7 @@ private:
         return _exhausted ?
                         nullptr :
                         ::make_shared<const paging_state>(*_last_pkey,
-                                        _last_ckey, _max);
+                                        _last_ckey, _max, _cmd->reader_save_uuid);
     }
 
 private:

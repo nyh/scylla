@@ -245,7 +245,7 @@ select_statement::do_execute(distributed<service::storage_proxy>& proxy,
     ++_stats.reads;
 
     auto command = ::make_lw_shared<query::read_command>(_schema->id(), _schema->version(),
-        make_partition_slice(options), limit, now, tracing::make_trace_info(state.get_trace_state()), query::max_partitions, options.get_timestamp(state));
+        make_partition_slice(options), limit, now, tracing::make_trace_info(state.get_trace_state()), query::max_partitions, utils::UUID(), utils::UUID(), false, options.get_timestamp(state));
 
     int32_t page_size = options.get_page_size();
 
@@ -348,7 +348,7 @@ select_statement::execute_internal(distributed<service::storage_proxy>& proxy,
     int32_t limit = get_limit(options);
     auto now = gc_clock::now();
     auto command = ::make_lw_shared<query::read_command>(_schema->id(), _schema->version(),
-        make_partition_slice(options), limit, now, std::experimental::nullopt, query::max_partitions, options.get_timestamp(state));
+        make_partition_slice(options), limit, now, std::experimental::nullopt, query::max_partitions, utils::UUID(), utils::UUID(), false, options.get_timestamp(state));
     auto partition_ranges = _restrictions->get_partition_key_ranges(options);
 
     tracing::add_table_name(state.get_trace_state(), keyspace(), column_family());

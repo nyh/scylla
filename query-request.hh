@@ -171,6 +171,34 @@ public:
     gc_clock::time_point timestamp;
     std::experimental::optional<tracing::trace_info> trace_info;
     uint32_t partition_limit; // The maximum number of live partitions to return.
+    // The "reader_recall_uuid" and "reader_save_uuid" fields are useful in
+    // pages queries: The reader_save_uuid field tells the replica that when
+    // it finishes the read request prematurely, i.e., reached the desired
+    // number of rows per page, it should not destroy the reader object,
+    // rather it should keep it alive - at its current position - and save it
+    // under the unique key "reader_save_uuid". Later, when we want to resume
+    // the read at exactly the same position (i.e., to request the next page)
+    // we can pass this same unique id in that query's "reader_recall_uuid"
+    // field.
+    // The caller must make sure to recall a saved reader by uuid if only if
+    // he really wants to resume reading at exactly the same spot.
+    // The two uids, recall and save, should be different, because this
+    // guarantees that recalling a reader can only be done once - if the
+    // same query is for some reason repeated, the second one will not find
+    // the saved reader (which is now saved under a new uuid) and will fall
+    // back to creating a new reader; And that's desired - the first copy
+    // of the query will have moved the reader's position, so the second copy
+    // would not have seen the correct position if we let it use the saved
+    // reader.
+    // If the reader_recall_drop flag is true, the reader for
+    // reader_recall_uuid is recalled, but *not* used, and instead dropped
+    // immediately. This is useful when we know that a reader that has
+    // previously been saved is not at the correct position, and we want to
+    // drop it before creating a new one. We don't need this flagged serialize
+    // over the wire because the type of verb used is enough to set it.
+    utils::UUID reader_recall_uuid;
+    utils::UUID reader_save_uuid;
+    bool reader_recall_drop; // not serialized
     api::timestamp_type read_timestamp; // not serialized
 public:
     read_command(utils::UUID cf_id,
@@ -180,6 +208,9 @@ public:
                  gc_clock::time_point now = gc_clock::now(),
                  std::experimental::optional<tracing::trace_info> ti = std::experimental::nullopt,
                  uint32_t partition_limit = max_partitions,
+                 utils::UUID recall_uuid = utils::UUID(),
+                 utils::UUID save_uuid = utils::UUID(),
+                 bool recall_drop = false,
                  api::timestamp_type rt = api::missing_timestamp)
         : cf_id(std::move(cf_id))
         , schema_version(std::move(schema_version))
@@ -188,6 +219,9 @@ public:
         , timestamp(now)
         , trace_info(std::move(ti))
         , partition_limit(partition_limit)
+        , reader_recall_uuid(recall_uuid)
+        , reader_save_uuid(save_uuid)
+        , reader_recall_drop(recall_drop)
         , read_timestamp(rt)
     { }
 
