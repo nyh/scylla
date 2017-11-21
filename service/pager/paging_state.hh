@@ -45,6 +45,7 @@
 
 #include "bytes.hh"
 #include "keys.hh"
+#include "utils/UUID.hh"
 
 namespace service {
 
@@ -54,9 +55,10 @@ class paging_state final {
     partition_key _partition_key;
     std::experimental::optional<clustering_key> _clustering_key;
     uint32_t _remaining;
+    utils::UUID _reader_recall_uuid;
 
 public:
-    paging_state(partition_key pk, std::experimental::optional<clustering_key> ck, uint32_t rem);
+    paging_state(partition_key pk, std::experimental::optional<clustering_key> ck, uint32_t rem, utils::UUID reader_recall_uuid);
 
     /**
      * Last processed key, i.e. where to start from in next paging round
@@ -76,6 +78,24 @@ public:
      */
     uint32_t get_remaining() const {
         return _remaining;
+    }
+
+    /**
+     * reader_recall_uuid is a unique key under which the replicas saved the
+     * readers used to serve the last page. These saved readers may be
+     * resumed (if not already purged from the cache) instead of opening new
+     * ones - as a performance optimization.
+     * Note that the coordinator changes this uuid after each page: like the
+     * proverbial river, a reader can only be resumed once because when used
+     * again it will no longer be in the same position. If a query is for
+     * some reason retried with the same uuid, it will not find a saved
+     * reader and will fall back to creating a new one.
+     * If the uuid is the invalid default-constructed UUID(), it means that
+     * the client got this paging_state from a coordinator running an older
+     * version of Scylla.
+     */
+    utils::UUID get_reader_recall_uuid() const {
+        return _reader_recall_uuid;
     }
 
     static ::shared_ptr<paging_state> deserialize(bytes_opt bytes);
