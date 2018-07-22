@@ -275,6 +275,7 @@ future<shared_ptr<cql_transport::event::schema_change>> create_view_statement::a
 
     std::vector<const column_definition*> missing_pk_columns;
     std::vector<const column_definition*> target_non_pk_columns;
+    std::vector<const column_definition*> unselected_columns;
 
     // We need to include all of the primary key columns from the base table in order to make sure that we do not
     // overwrite values in the view. We cannot support "collapsing" the base table into a smaller number of rows in
@@ -291,6 +292,9 @@ future<shared_ptr<cql_transport::event::schema_change>> create_view_statement::a
         bool def_in_target_pk = std::find(target_primary_keys.begin(), target_primary_keys.end(), &def) != target_primary_keys.end();
         if (included_def && !def_in_target_pk) {
             target_non_pk_columns.push_back(&def);
+        }
+        if (!included_def && !def_in_target_pk && !def.is_static()) {
+            unselected_columns.push_back(&def);
         }
         if (def.is_primary_key() && !def_in_target_pk) {
             missing_pk_columns.push_back(&def);
@@ -321,6 +325,48 @@ future<shared_ptr<cql_transport::event::schema_change>> create_view_statement::a
     add_columns(target_partition_keys, column_kind::partition_key);
     add_columns(target_clustering_keys, column_kind::clustering_key);
     add_columns(target_non_pk_columns, column_kind::regular_column);
+    // Add all unselected columns (base-table columns which are not selected
+    // in the view) as "virtual columns" - columns which have timestamp and
+    // ttl information, but an empty value. These are needed to keep view
+    // rows alive when the base row is alive, even if the view row has no
+    // data, just a key (see issue #3362). The virtual columns are not needed
+    // when the view pk adds a regular base column (i.e., has_non_pk_column)
+    // because in that case, the liveness of that base column is what
+    // determines the liveness of the view row.
+    if (!has_non_pk_column) {
+        for (auto* def : unselected_columns) {
+            if (def->is_atomic()) {
+                builder.with_column(def->name(), empty_type, column_kind::regular_column, column_view_virtual::yes);
+            } else {
+                // A multi-cell collection (a frozen collection is a single
+                // cell and handled handled in the is_atomic() case above).
+                // The virtual version can't be just one cell, it has to be
+                // itself a collection of cells.
+                auto ctype = dynamic_pointer_cast<const collection_type_impl>(def->type);
+                if (!ctype) {
+                    throw exceptions::invalid_request_exception(sprint("Unsupported unselected multi-cell non-collection column %s for Materialized View", def->name_as_text()));
+                }
+                if (ctype->is_list()) {
+                    // A list has ints as keys, and values (the list's items).
+                    // We just need these intss, i.e., a list of empty items.
+                    builder.with_column(def->name(), list_type_impl::get_instance(empty_type, true), column_kind::regular_column, column_view_virtual::yes);
+                } else if (ctype->is_map()) {
+                    // A map has keys and values. We don't need these values,
+                    // and can use empty values instead.
+                    auto mtype = dynamic_pointer_cast<const map_type_impl>(def->type);
+                    builder.with_column(def->name(), map_type_impl::get_instance(mtype->get_values_type(), empty_type, true), column_kind::regular_column, column_view_virtual::yes);
+                } else if (ctype->is_set()) {
+                    // A set's cell has nothing beyond the keys, so the
+                    // virtual version of a set is, unfortunately, a complete
+                    // copy of the set.
+                    builder.with_column(def->name(), def->type, column_kind::regular_column, column_view_virtual::yes);
+                } else {
+                    // A collection can't be anything but a list, map or set...
+                    abort();
+                }
+            }
+        }
+    }
     _properties.properties()->apply_to_builder(builder, proxy.get_db().local().get_config().extensions());
 
     if (builder.default_time_to_live().count() > 0) {
