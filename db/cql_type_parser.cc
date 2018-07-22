@@ -37,6 +37,23 @@
  * You should have received a copy of the GNU General Public License
  * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
  */
+
+// The db::cql_type_parser::parse() function, implemented in this file,
+// is the inverse of type->as_cql3_type()->to_string():
+//
+// type->as_cql3_type()->to_string() converts a data_type into a string with
+// CQL-like syntax which represents this type. E.g., "int" or "list<float>".
+// The inverse, parse(), converts such a string back to a data_type.
+// The syntax that parse() understands is CQL-like but not limited to CQL
+// types, because we may have types which do not have a CQL syntax. The
+// primary example today is empty_type, whose string name is "empty" -
+// a type which does not exist in CQL but we use internally for dense tables
+// without regular columns and for keeping rows alive in materialized views.
+//
+// The only place where Scylla uses these mechanisms for converting types to
+// CQL-like strings and back are in the schema tables (see schema_tables.cc),
+// which saves to disk the definition of schemas and their column's types.
+
 #include <unordered_map>
 #include <boost/range/adaptor/map.hpp>
 #include <boost/range/adaptor/sliced.hpp>
@@ -52,7 +69,12 @@ static ::shared_ptr<cql3::cql3_type::raw> parse_raw(const sstring& str) {
     return cql3::util::do_with_parser(str,  std::mem_fn(&cql3_parser::CqlParser::comparatorType));
 }
 
-data_type db::cql_type_parser::parse(const sstring& keyspace, const sstring& str, lw_shared_ptr<user_types_metadata> user_types) {
+// Check if a given string is the name of one of the native types listed in
+// cql3::cql3_type::values(). This includes CQL's native types (int, text,
+// etc.) but may also include other types which have a name but are not
+// supported by the CQL syntax (e.g., empty_type has the name "empty").
+// Returns the data_type, or null data_type when s is not a native type.
+static data_type parse_native_type(const sstring_view& s) {
     static const thread_local std::unordered_map<sstring, shared_ptr<cql3::cql3_type>> native_types = []{
         std::unordered_map<sstring, shared_ptr<cql3::cql3_type>> res;
         for (auto& nt : cql3::cql3_type::values()) {
@@ -60,10 +82,73 @@ data_type db::cql_type_parser::parse(const sstring& keyspace, const sstring& str
         }
         return res;
     }();
-
-    auto i = native_types.find(str);
+    // it's unfortunate we need to convert string_view to string to use find()...
+    auto i = native_types.find(sstring(s));
     if (i != native_types.end()) {
         return i->second->get_type();
+    }
+    return data_type();
+}
+
+// sstring_view will have startswith, endswith methods in C++20.
+// Meanwhile, let's use our own versions.
+static bool startswith(const sstring_view& s, const char* x) {
+    auto xsize = strlen(x);
+    return s.size() >= xsize && s.compare(0, xsize, x) == 0;
+}
+static bool endswith(const sstring_view& s, char x) {
+    return s.size() >= 1 && s[s.size() - 1] == x;
+}
+
+// Check if a given string is a container of native types (list<type>,
+// set<type> or map<type1, type2>).
+static data_type parse_container_type(const sstring_view& s, bool is_multi_cell) {
+    if (endswith(s, '>')) {
+        if (startswith(s, "list<")) {
+            auto t = parse_native_type(s.substr(5, s.size() - 6));
+            if (t) {
+                return list_type_impl::get_instance(t, is_multi_cell);
+            }
+        } else if (startswith(s, "set<")) {
+            auto t = parse_native_type(s.substr(4, s.size() - 5));
+            if (t) {
+                return set_type_impl::get_instance(t, is_multi_cell);
+            }
+        } else if (startswith(s, "map<")) {
+            auto c = s.find(", ", 4);
+            if (c != sstring_view::npos) {
+                auto t1 = parse_native_type(s.substr(4, c - 4));
+                auto t2 = parse_native_type(s.substr(c + 2, s.size() - c - 3));
+                if (t1 && t2) {
+                    return map_type_impl::get_instance(t1, t2, is_multi_cell);
+                }
+            }
+        }
+    }
+    return data_type();
+}
+
+// Check if given string is a frozen container e.g. frozen<map<type1, type2>.
+static data_type parse_frozen_container_type(const sstring_view& s) {
+    if (startswith(s, "frozen<") && endswith(s, '>')) {
+        return parse_container_type(s.substr(7, s.size() - 8), false);
+    }
+    return data_type();
+}
+
+data_type db::cql_type_parser::parse(const sstring& keyspace, const sstring& str, lw_shared_ptr<user_types_metadata> user_types) {
+    data_type ret;
+    ret = parse_native_type(str);
+    if (ret) {
+        return ret;
+    }
+    ret = parse_container_type(str, true);
+    if (ret) {
+        return ret;
+    }
+    ret = parse_frozen_container_type(str);
+    if (ret) {
+        return ret;
     }
 
     if (!user_types && service::get_storage_proxy().local_is_initialized()) {
@@ -78,6 +163,10 @@ data_type db::cql_type_parser::parse(const sstring& keyspace, const sstring& str
         }
     }
 
+    // Fall through to the full-fledged CQL syntax parser, in case the
+    // above did not work. Note that the above may have understood types that
+    // the CQL parser can't, e.g., empty_type does not have CQL syntax.
+    // FIXME: is this case needed any more?
     auto raw = parse_raw(str);
     auto cql = raw->prepare_internal(keyspace, user_types);
     return cql->get_type();
