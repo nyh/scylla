@@ -72,15 +72,13 @@ progresses and compatibility continues to improve.
 ### Item Operations
 * GetItem: Support almost complete except that projection expressions can
   only ask for top-level attributes.
-* PutItem: Does not yet support conditional expressions (to only add an item
-  if some condition is true), nor return values (optional return of pre-put
-  content).
-* UpdateItem: Like PutItem does not yet support conditional expression nor
-  return values. Read-modify-write operations such as `SET a=b`,
-  `SET a=if_not_exist(a,bal)`, or `SET a=a+1, are supported but not protected
-  against concurrent operations. Nested documents are supported but updates
+* PutItem: Conditional updates using the "Expected" option are supported,
+  but the "ConditionExpression" syntax is not supported yet.
+  Return values (optional return of pre-put content) not yet supported..
+* UpdateItem: Like PutItem does not yet support ConditionExpression or
+  return values. Nested documents are supported but updates
   to nested attributes are not (e.g., `SET a.b[3].c=val`).
-* DeleteItem: Mostly works, but again does not support conditional expression
+* DeleteItem: Mostly works, but again does not support ConditionExpression
   or return values.
 ### Batch Operations
 * BatchGetItem: Almost complete except that projection expressions can only
