@@ -1,0 +1,87 @@
+#!/bin/bash 
+
+# Exit if any one of the commands below fails
+set -e
+
+script_path=$(dirname $(readlink -e $0))
+
+SCYLLA=${SCYLLA-$script_path/../build/dev/scylla}
+SCYLLA_IP=${IP-127.0.0.1}
+CPUSET=${CPUSET-0}
+
+
+
+tmp_dir=/tmp/alternator-test-$$
+mkdir $tmp_dir
+
+# We the cleanup() function on exit for any reason - successful finish
+# of the script, an error (since we have "set -e"), or a signal.
+# It ensures that Scylla is killed and its temporary storage directory is
+# deleted. It also shows Scylla's output log.
+code=17
+cleanup() {
+    kill -9 $SCYLLA_PROCESS 2>/dev/null || :
+    echo
+    echo "Scylla log:"
+    echo
+    cat "$tmp_dir/log"
+    rm -rf --preserve-root "$tmp_dir"
+    case $code in
+    0) echo Alternator tests pass;;
+    *) echo Alternator tests failure;;
+    esac
+    exit $code
+}
+trap 'cleanup' EXIT
+
+# Set up SSL certificates needed for "--alternator-https-port=8043"
+# to work. TODO: we can care these certificates, and open the https port,
+# only if the "--https" option will be passed to pytest.
+openssl genrsa 2048 > "$tmp_dir/scylla.key"
+openssl req -new -x509 -nodes -sha256 -days 365 -subj "/C=IL/ST=None/L=None/O=None/OU=None/CN=example.com" -key "$tmp_dir/scylla.key" -out "$tmp_dir/scylla.crt"
+
+"$SCYLLA" --options-file "$script_path/../conf/scylla.yaml" \
+         --alternator-address $SCYLLA_IP \
+        --alternator-port=8000 --alternator-https-port=8043 \
+        --alternator-enforce-authorization=1 \
+        --experimental=on --developer-mode=1 \
+        --ring-delay-ms 0 --collectd 0 \
+        --cpuset "$CPUSET" -m 1G \
+        --api-address $SCYLLA_IP --rpc-address $SCYLLA_IP \
+        --listen-address $SCYLLA_IP \
+        --seed-provider-parameters seeds=$SCYLLA_IP \
+        --workdir "$tmp_dir" \
+        --server-encryption-options keyfile="$tmp_dir/scylla.key" \
+        --server-encryption-options certificate="$tmp_dir/scylla.crt" \
+        >"$tmp_dir/log" 2>&1 &
+SCYLLA_PROCESS=$!
+
+# Set up the the proper authentication credentials needed by the Alternator
+# test. This requires connecting to Scylla with cqlsh - we'll wait up for
+# one minute for this to work:
+echo "Scylla is: $SCYLLA."
+echo -n "Booting Scylla..."
+ok=
+SECONDS=0
+while ((SECONDS < 60))
+do
+    sleep 2
+    echo -n .
+    cqlsh -e "INSERT INTO system_auth.roles (role, salted_hash) VALUES ('alternator', 'secret_pass')" 2>/dev/null && ok=yes && break
+done
+if test -n "$ok"
+then
+    echo "Done ($SECONDS seconds)"
+else
+    echo
+    echo "Failed to boot after $SECONDS seconds. The log:"
+    exit 1
+fi
+
+cd "$script_path"
+pytest "$@"
+code=$?
+
+# Note that the cleanup() function runs now, just like on any exit from
+# any reason in this script. It will delete the temporary files and
+# announce the failure or success of the test.
