@@ -4,9 +4,10 @@
 set -e
 
 script_path=$(dirname $(readlink -e $0))
+source_path=$script_path/../..
 
 # By default, we take the latest build/*/scylla as the executable:
-SCYLLA=${SCYLLA-$(ls -t "$script_path/../build/"*"/scylla" | head -1)}
+SCYLLA=${SCYLLA-$(ls -t "$source_path/build/"*"/scylla" | head -1)}
 SCYLLA=$(readlink -f "$SCYLLA")
 SCYLLA_IP=${IP-127.0.0.1}
 CPUSET=${CPUSET-0}
@@ -60,7 +61,7 @@ do
         alternator_port_option="--alternator-https-port=8043"
     fi
 done
-"$SCYLLA" --options-file "$script_path/../conf/scylla.yaml" \
+"$SCYLLA" --options-file "$source_path/conf/scylla.yaml" \
          --alternator-address $SCYLLA_IP \
         $alternator_port_option \
         --alternator-enforce-authorization=1 \
