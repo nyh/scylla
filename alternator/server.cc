@@ -24,6 +24,7 @@
 #include "gms/gossiper.hh"
 #include "utils/overloaded_functor.hh"
 #include "utils/fb_utilities.hh"
+#include "auth/common.hh"
 
 static logging::logger slogger("alternator-server");
 
@@ -522,6 +523,19 @@ server::server(executor& exec, service::storage_proxy& proxy, gms::gossiper& gos
         }},
     } {
 }
+
+// As explained in docs/alternator/alternator.md, Alternator currently takes
+// the secret keys from the system_auth.roles table. As explained in issue
+// #6440, Scylla currently has a bug where the system_auth keyspace defaults
+// to RF=1, which is unusable on clusters with more than one node. Until this
+// bug is fixed, users manually need to follow the instructions in
+// https://docs.scylladb.com/operating-scylla/procedures/cluster-management/add_node_to_cluster/#prerequisites
+// for adding more nodes. Here we want to verify these instructions were
+// followed.
+//static future<> verify_system_auth_rf() {
+//    // NYH: continue here
+//    auth::meta::AUTH_KS;
+//}
 
 future<> server::init(net::inet_address addr, std::optional<uint16_t> port, std::optional<uint16_t> https_port, std::optional<tls::credentials_builder> creds,
         bool enforce_authorization, semaphore* memory_limiter, utils::updateable_value<uint32_t> max_concurrent_requests) {
