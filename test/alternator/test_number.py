@@ -154,3 +154,28 @@ def test_update_expression_plus_imprecise(test_table_s):
         test_table_s.update_item(Key={'p': p},
             UpdateExpression='SET b = :val1 + :val2',
             ExpressionAttributeValues={':val1': Decimal("1e50"), ':val2': Decimal("1")})
+
+# Test that invalid strings cannot be stored as numbers and produce the
+# expected error. This includes random non-numeric strings (e.g., "dog"),
+# various syntax errors, and also the strings "NaN" and "Infinity", which
+# although may be legal numbers in other systems (including Python), are
+# not supported by DynamoDB.
+# We cannot write this test using boto3's high-level "resource" API because
+# it validates the numeric parameter before sending it to the server, but
+# we can test this using the low-level "client" API:
+def test_invalid_numbers(test_table_s):
+    p = random_string()
+    client = test_table_s.meta.client
+    print(client)
+    for s in ['NaN', 'Infinity', '-Infinity', '-NaN', 'dog', '-dog']:
+        print(s)
+        #client.update_item(TableName=test_table_s.name,
+        #    Key={'p': {'S': p}},
+        #    UpdateExpression='SET a = :val',
+        #    ExpressionAttributeValues={':val': {'N': s}})
+        client._make_api_call('UpdateItem', {
+            'TableName': test_table_s.name,
+            'Key': {'p': {'S': p}},
+            'UpdateExpression': 'SET a = :val',
+            'ExpressionAttributeValues': {':val': {'N': s}}
+        })
