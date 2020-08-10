@@ -379,6 +379,22 @@ def test_query_reverse_paging(test_table_sn):
         got_sort_keys = [x['c'] for x in got_items]
         assert got_sort_keys == reversed_numbers
 
+# Test that a reverse query also works for long partitions. This test
+# currently fails because for performance reasons, reverse queries are
+# artificially limited to 100MB. See issue #6307.
+# max_memory_for_unlimited_query_hard_limit
+#def test_query_reverse_long(test_table_sn):
+#    # Insert a bunch of big strings into one partition:
+#    p = random_string()
+#    str = 'x' * 10240
+#    numbers = range(10000)
+#    with test_table_sn.batch_writer() as batch:
+#        for i in numbers:
+#            batch.put_item({'p': p, 'c': i, 's': str})
+#    #got_items = full_query(test_table_sn, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, ScanIndexForward=False)
+#    #got_sort_keys = [x['c'] for x in got_items]
+#    #assert got_sort_keys == list(reversed(numbers))
+
 # A query without a KeyConditions or KeyConditionExpress is, or an empty
 # one, is obviously not allowed:
 def test_query_missing_key(test_table):
