@@ -1465,7 +1465,30 @@ def test_streams_disabled_stream(test_table_ss_keys_only, dynamodbstreams):
             assert not 'NextShardIterator' in response
     assert nrecords == 1
 
-# TODO: tests on multiple partitions
+# TODO: can also check Limit=1 works without the complications below.
+# need to add a Limit option to the general compare_events, and do
+# a test with Limit=1. The compare_events with Limit option can also verify
+# we get not more than Limit results. I think it is fine to get less -
+# this is what normally happens if there aren't more results yet.
+# BUT - think - maybe clients assume that if there is <Limit results, it
+# means we need to wait?
+
+# TODO: tests on multiple partitions. With N shards, we can write to N+1
+# random partitions and be sure (pigeonhole principle!) that at least two
+# writes from *different* partitions go to the same shard. Once we find
+# those two partitions, we can now write to several items to both of them,
+# and see if we can read them in the correct order, for example, although
+# I don't think the order really matters. More important is to reproduce
+# the bug which Calle almost introduced in the attempt to merge multiple
+# CDC streams to one Alternator Streams shard - the last timestamp can't
+# be the last timestamp of one random stream. So we should try writing
+# to the different partitions mapping to the same shard, and then read
+# them one by one (Limit=1) and see we get them all. This is also an
+# opportunity to check Limit=1 works (and gives all the information,
+# including the preimage and postimage). In addition to Limit=1, we can
+# also use AT_SEQUENCE_NUMBER to go back to specific timestamps and see
+# these also work.
+#
 # TODO: write a test that disabling the stream and re-enabling it works, but
 #   requires the user to wait for the first stream to become DISABLED before
 #   creating the new one. Then ListStreams should return the two streams,
