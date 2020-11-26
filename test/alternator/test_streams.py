@@ -1497,3 +1497,8 @@ def test_streams_disabled_stream(test_table_ss_keys_only, dynamodbstreams):
 # TODO: Can we test shard splitting? (shard splitting
 #   requires the user to - periodically or following shards ending - to call
 #   DescribeStream again. We don't do this in any of our tests.
+
+# TODO: Write a test that GetRecords bypasses the cache.
+# see request in https://github.com/scylladb/scylla/issues/7639
+# see dtest bypass_cache_test.py for example of using REST API to check bypass cache.
+# I have in test/alternator/test_tracing.py an example of a Scylla-only Alternator test which uses the REST API. So I can easily write an Alternator Streams test which verifies that a GetRecords call really bypasses the cache - by doing the same GetRecords call twice and note that the second call comes from disk as well. This will ensure that this feature (GetRecords bypasses cache) doesn't break even if one of the implementation details in the middle change. 
