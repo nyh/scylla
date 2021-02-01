@@ -30,11 +30,13 @@ from cassandra.protocol import FunctionFailure, InvalidRequest
 
 import pytest
 import random
+import json
+from decimal import Decimal
 
 @pytest.fixture(scope="session")
 def table1(cql, test_keyspace):
     table = test_keyspace + "." + unique_name()
-    cql.execute(f"CREATE TABLE {table} (p int PRIMARY KEY, v int, a ascii, b boolean, vi varint, mai map<ascii, int>, tup frozen<tuple<text, int>>, l list<text>, d double)")
+    cql.execute(f"CREATE TABLE {table} (p int PRIMARY KEY, v int, a ascii, b boolean, vi varint, mai map<ascii, int>, tup frozen<tuple<text, int>>, l list<text>, d double, t time, dec decimal)")
     yield table
     cql.execute("DROP TABLE " + table)
 
@@ -237,3 +239,43 @@ def test_tojson_double(cql, table1):
     # does not work.
     cql.execute(stmt, [p, 123123.123123])
     assert list(cql.execute(f"SELECT d, toJson(d) from {table1} where p = {p}")) == [(123123.123123, "123123.123123")]
+
+# Check that toJson() correctly formats "time" values. The JSON translation
+# is a string containing the time (there is no time type in JSON), and of
+# course, a string needs to be wrapped in quotes. (issue #7988
+@pytest.mark.xfail(reason="issue #7988")
+def test_tojson_time(cql, table1):
+    p = random.randint(1,1000000000)
+    stmt = cql.prepare(f"INSERT INTO {table1} (p, t) VALUES (?, ?)")
+    cql.execute(stmt, [p, 123])
+    assert list(cql.execute(f"SELECT toJson(t) from {table1} where p = {p}")) == [('"00:00:00.000000123"',)]
+
+# The EquivalentJson class wraps a JSON string, and compare equal to other
+# strings if both are valid JSON strings which decode to the same object.
+# EquivalentJson("....") can be used in assert_rows() checks below, to check
+# whether functionally-equivalent JSON is returned instead of checking for
+# identical strings.
+class EquivalentJson:
+    def __init__(self, s):
+        self.obj = json.loads(s)
+    def __eq__(self, other):
+        if isinstance(other, EquivalentJson):
+            return self.obj == other.obj
+        elif isinstance(other, str):
+            return self.obj == json.loads(other)
+        return NotImplemented
+    # Implementing __repr__ is useful because when a comparison fails, pytest
+    # helpfully prints what it tried to compare, and uses __repr__ for that.
+    def __repr__(self):
+        return f'EquivalentJson("{self.obj}")'
+
+# Test that toJson() can prints a decimal type with a very high mantissa.
+# Reproduces issue #8002, where it was written as 1 and a billion zeroes,
+# running out of memory.
+@pytest.mark.xfail(reason="issue #8002")
+def test_tojson_decimal_high_mantissa(cql, table1):
+    p = random.randint(1,1000000000)
+    stmt = cql.prepare(f"INSERT INTO {table1} (p, dec) VALUES ({p}, ?)")
+    high = '1e1000000000'
+    cql.execute(stmt, [Decimal(high)])
+    assert list(cql.execute(f"SELECT toJson(dec) from {table1} where p = {p}")) == [(EquivalentJson(high),)]
