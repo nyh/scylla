@@ -22,11 +22,13 @@
 from cassandra_tests.porting import *
 
 from cassandra.protocol import FunctionFailure
-from cassandra.util import Date, Time
+from cassandra.util import Date, Time, Duration
 
 from decimal import Decimal
 from uuid import UUID
 from datetime import datetime, timezone
+from socket import getaddrinfo
+import json
 
 def testSelectJsonWithPagingWithFrozenTuple(cql, test_keyspace):
     uuid = UUID("2dd2cd62-6af3-4cf6-96fc-91b9ab62eedc")
@@ -34,7 +36,7 @@ def testSelectJsonWithPagingWithFrozenTuple(cql, test_keyspace):
     with create_table(cql, test_keyspace, "(k1 FROZEN<TUPLE<uuid, int>>, c1 frozen<tuple<uuid, int>>, value int, PRIMARY KEY (k1, c1))") as table:
         # prepare data
         for i in range(1, 5):
-            execute(cql, table, "INSERT INTO %s (k1, c1, value) VALUES (?, ?, ?)", partitionKey, (uuid, i), i);
+            execute(cql, table, "INSERT INTO %s (k1, c1, value) VALUES (?, ?, ?)", partitionKey, (uuid, i), i)
 
         for pageSize in range(1, 6):
             # SELECT JSON
@@ -103,7 +105,7 @@ def testSelectJsonWithPagingWithFrozenList(cql, test_keyspace):
     with create_table(cql, test_keyspace, "(k1 frozen<list<tuple<uuid, int>>>, c1 frozen<tuple<uuid, int>>, value int, PRIMARY KEY (k1, c1))") as table:
         # prepare data
         for i in range(1, 5):
-            execute(cql, table, "INSERT INTO %s (k1, c1, value) VALUES (?, ?, ?)", partitionKey, (uuid, i), i);
+            execute(cql, table, "INSERT INTO %s (k1, c1, value) VALUES (?, ?, ?)", partitionKey, (uuid, i), i)
 
         for pageSize in range(1, 6):
             # SELECT JSON
@@ -145,8 +147,8 @@ def testSelectJsonWithPagingWithFrozenUDT(cql, test_keyspace):
                           ["{\"a\": 1, \"b\": 2, \"c\": [\"1\", \"2\"]}", "[\"" + str(uuid) + "\", 3]", "3"],
                           ["{\"a\": 1, \"b\": 2, \"c\": [\"1\", \"2\"]}", "[\"" + str(uuid) + "\", 4]", "4"])
 
-# Reproduces issue #7911, #7912, #7914, #7915.
-@pytest.mark.xfail(reason="issues #7912, #7914, #7915")
+# Reproduces issue #7911, #7912, #7914, #7915, #7944, #7954
+@pytest.mark.xfail(reason="issues #7912, #7914, #7915, #7944, #7954")
 def testFromJsonFct(cql, test_keyspace):
     abc_tuple = collections.namedtuple('abc_tuple', ['a', 'b', 'c'])
     with create_type(cql, test_keyspace, "(a int, b uuid, c set<text>)") as type_name:
@@ -184,14 +186,14 @@ def testFromJsonFct(cql, test_keyspace):
             # Cassandra and Scylla print different error messages - Cassandra
             # says "fromJson() cannot be used in the selection clause", Scylla
             # "fromJson() can only be called if receiver type is known".
-            assert_invalid_message(cql, table, "fromJson()", "SELECT fromJson(asciival) FROM %s", 0, 0);
+            assert_invalid_message(cql, table, "fromJson()", "SELECT fromJson(asciival) FROM %s", 0, 0)
 
             # FIXME: the following tests need *Java* as a UDF language, while
             # Scylla uses Lua, so I didn't translate them.
-            #String func1 = createFunction(KEYSPACE, "int", "CREATE FUNCTION %s (a int) CALLED ON NULL INPUT RETURNS text LANGUAGE java AS $$ return a.toString(); $$");
-            #createFunctionOverload(func1, "int", "CREATE FUNCTION %s (a text) CALLED ON NULL INPUT RETURNS text LANGUAGE java AS $$ return new String(a); $$");
+            #String func1 = createFunction(KEYSPACE, "int", "CREATE FUNCTION %s (a int) CALLED ON NULL INPUT RETURNS text LANGUAGE java AS $$ return a.toString(); $$")
+            #createFunctionOverload(func1, "int", "CREATE FUNCTION %s (a text) CALLED ON NULL INPUT RETURNS text LANGUAGE java AS $$ return new String(a); $$")
             #assertInvalidMessage("Ambiguous call to function",
-            #    "INSERT INTO %s (k, textval) VALUES (?, " + func1 + "(fromJson(?)))", 0, "123");
+            #    "INSERT INTO %s (k, textval) VALUES (?, " + func1 + "(fromJson(?)))", 0, "123")
 
             # fails JSON parsing
             # Reproduces issue #7911:
@@ -200,15 +202,14 @@ def testFromJsonFct(cql, test_keyspace):
 
             # handle nulls
             # Reproduces issue #7912:
-            # NYH
-            #execute(cql, table, "INSERT INTO %s (k, asciival) VALUES (?, fromJson(?))", 0, None)
-            #assert_rows(execute(cql, table, "SELECT k, asciival FROM %s WHERE k = ?", 0), [0, None])
+            execute(cql, table, "INSERT INTO %s (k, asciival) VALUES (?, fromJson(?))", 0, None)
+            assert_rows(execute(cql, table, "SELECT k, asciival FROM %s WHERE k = ?", 0), [0, None])
 
-            #execute(cql, table, "INSERT INTO %s (k, frozenmapval) VALUES (?, fromJson(?))", 0, None);
-            #assert_rows(execute(cql, table, "SELECT k, frozenmapval FROM %s WHERE k = ?", 0), [0, None])
+            execute(cql, table, "INSERT INTO %s (k, frozenmapval) VALUES (?, fromJson(?))", 0, None)
+            assert_rows(execute(cql, table, "SELECT k, frozenmapval FROM %s WHERE k = ?", 0), [0, None])
 
-            #execute(cql, table, "INSERT INTO %s (k, udtval) VALUES (?, fromJson(?))", 0, None)
-            #assert_rows(execute(cql, table, "SELECT k, udtval FROM %s WHERE k = ?", 0), [0, None])
+            execute(cql, table, "INSERT INTO %s (k, udtval) VALUES (?, fromJson(?))", 0, None)
+            assert_rows(execute(cql, table, "SELECT k, udtval FROM %s WHERE k = ?", 0), [0, None])
 
             # ================ ascii ================
             execute(cql, table, "INSERT INTO %s (k, asciival) VALUES (?, fromJson(?))", 0, "\"ascii text\"")
@@ -238,9 +239,8 @@ def testFromJsonFct(cql, test_keyspace):
 
             # overflow (Long.MAX_VALUE + 1)
             # Reproduces #7914
-            # NYH
-            #assert_invalid_throw_message(cql, table, "Expected a bigint value, but got a", FunctionFailure,
-            #    "INSERT INTO %s (k, bigintval) VALUES (?, fromJson(?))", 0, "9223372036854775808")
+            assert_invalid_throw_message(cql, table, "Expected a bigint value, but got a", FunctionFailure,
+                "INSERT INTO %s (k, bigintval) VALUES (?, fromJson(?))", 0, "9223372036854775808")
 
             # Reproduces #7911
             assert_invalid_throw(cql, table, FunctionFailure,
@@ -265,17 +265,16 @@ def testFromJsonFct(cql, test_keyspace):
                 "INSERT INTO %s (k, blobval) VALUES (?, fromJson(?))", 0, "123")
 
             # ================ boolean ================
-            execute(cql, table, "INSERT INTO %s (k, booleanval) VALUES (?, fromJson(?))", 0, "true");
+            execute(cql, table, "INSERT INTO %s (k, booleanval) VALUES (?, fromJson(?))", 0, "true")
             assert_rows(execute(cql, table, "SELECT k, booleanval FROM %s WHERE k = ?", 0), [0, True])
 
-            execute(cql, table, "INSERT INTO %s (k, booleanval) VALUES (?, fromJson(?))", 0, "false");
+            execute(cql, table, "INSERT INTO %s (k, booleanval) VALUES (?, fromJson(?))", 0, "false")
             assert_rows(execute(cql, table, "SELECT k, booleanval FROM %s WHERE k = ?", 0), [0, False])
 
             # strings are also accepted
             # Reproduces issue #7915
-            # NYH
-            #execute(cql, table, "INSERT INTO %s (k, booleanval) VALUES (?, fromJson(?))", 0, "\"false\"")
-            #assert_rows(execute(cql, table, "SELECT k, booleanval FROM %s WHERE k = ?", 0), [0, False])
+            execute(cql, table, "INSERT INTO %s (k, booleanval) VALUES (?, fromJson(?))", 0, "\"false\"")
+            assert_rows(execute(cql, table, "SELECT k, booleanval FROM %s WHERE k = ?", 0), [0, False])
 
             # Reproduces #7911
             assert_invalid_throw(cql, table, FunctionFailure,
@@ -284,24 +283,24 @@ def testFromJsonFct(cql, test_keyspace):
                 "INSERT INTO %s (k, booleanval) VALUES (?, fromJson(?))", 0, "123")
 
             # ================ date ================
-            execute(cql, table, "INSERT INTO %s (k, dateval) VALUES (?, fromJson(?))", 0, "\"1987-03-23\"");
+            execute(cql, table, "INSERT INTO %s (k, dateval) VALUES (?, fromJson(?))", 0, "\"1987-03-23\"")
             assert_rows(execute(cql, table, "SELECT k, dateval FROM %s WHERE k = ?", 0), [0, Date("1987-03-23")])
 
             # Reproduces #7911
             assert_invalid_throw(cql, table, FunctionFailure,
-                "INSERT INTO %s (k, dateval) VALUES (?, fromJson(?))", 0, "123");
+                "INSERT INTO %s (k, dateval) VALUES (?, fromJson(?))", 0, "123")
             assert_invalid_throw_message(cql, table, "Unable to coerce 'xyz' to a formatted date", FunctionFailure,
-                "INSERT INTO %s (k, dateval) VALUES (?, fromJson(?))", 0, "\"xyz\"");
+                "INSERT INTO %s (k, dateval) VALUES (?, fromJson(?))", 0, "\"xyz\"")
 
             # ================ decimal ================
-            execute(cql, table, "INSERT INTO %s (k, decimalval) VALUES (?, fromJson(?))", 0, "123123.123123");
+            execute(cql, table, "INSERT INTO %s (k, decimalval) VALUES (?, fromJson(?))", 0, "123123.123123")
             assert_rows(execute(cql, table, "SELECT k, decimalval FROM %s WHERE k = ?", 0), [0, Decimal("123123.123123")])
 
-            execute(cql, table, "INSERT INTO %s (k, decimalval) VALUES (?, fromJson(?))", 0, "123123");
+            execute(cql, table, "INSERT INTO %s (k, decimalval) VALUES (?, fromJson(?))", 0, "123123")
             assert_rows(execute(cql, table, "SELECT k, decimalval FROM %s WHERE k = ?", 0), [0, Decimal("123123")])
 
             # accept strings for numbers that cannot be represented as doubles
-            execute(cql, table, "INSERT INTO %s (k, decimalval) VALUES (?, fromJson(?))", 0, "\"123123.123123\"");
+            execute(cql, table, "INSERT INTO %s (k, decimalval) VALUES (?, fromJson(?))", 0, "\"123123.123123\"")
             assert_rows(execute(cql, table, "SELECT k, decimalval FROM %s WHERE k = ?", 0), [0, Decimal("123123.123123")])
 
             execute(cql, table, "INSERT INTO %s (k, decimalval) VALUES (?, fromJson(?))", 0, "\"-1.23E-12\"")
@@ -309,9 +308,9 @@ def testFromJsonFct(cql, test_keyspace):
 
             # Reproduces #7911
             assert_invalid_throw(cql, table, FunctionFailure,
-                "INSERT INTO %s (k, decimalval) VALUES (?, fromJson(?))", 0, "\"xyzz\"");
+                "INSERT INTO %s (k, decimalval) VALUES (?, fromJson(?))", 0, "\"xyzz\"")
             assert_invalid_throw(cql, table, FunctionFailure,
-                "INSERT INTO %s (k, decimalval) VALUES (?, fromJson(?))", 0, "true");
+                "INSERT INTO %s (k, decimalval) VALUES (?, fromJson(?))", 0, "true")
 
             # ================ double ================
             execute(cql, table, "INSERT INTO %s (k, doubleval) VALUES (?, fromJson(?))", 0, "123123.123123")
@@ -328,7 +327,7 @@ def testFromJsonFct(cql, test_keyspace):
             assert_invalid_throw(cql, table, FunctionFailure,
                 "INSERT INTO %s (k, doubleval) VALUES (?, fromJson(?))", 0, "\"xyzz\"")
             assert_invalid_throw(cql, table, FunctionFailure,
-                "INSERT INTO %s (k, doubleval) VALUES (?, fromJson(?))", 0, "true");
+                "INSERT INTO %s (k, doubleval) VALUES (?, fromJson(?))", 0, "true")
 
             # ================ float ================
             execute(cql, table, "INSERT INTO %s (k, floatval) VALUES (?, fromJson(?))", 0, "123123.123123")
@@ -343,9 +342,9 @@ def testFromJsonFct(cql, test_keyspace):
 
             # Reproduces #7911
             assert_invalid_throw(cql, table, FunctionFailure,
-                "INSERT INTO %s (k, floatval) VALUES (?, fromJson(?))", 0, "\"xyzz\"");
+                "INSERT INTO %s (k, floatval) VALUES (?, fromJson(?))", 0, "\"xyzz\"")
             assert_invalid_throw(cql, table, FunctionFailure,
-                "INSERT INTO %s (k, floatval) VALUES (?, fromJson(?))", 0, "true");
+                "INSERT INTO %s (k, floatval) VALUES (?, fromJson(?))", 0, "true")
 
             # ================ inet ================
             execute(cql, table, "INSERT INTO %s (k, inetval) VALUES (?, fromJson(?))", 0, "\"127.0.0.1\"")
@@ -370,9 +369,8 @@ def testFromJsonFct(cql, test_keyspace):
 
             # int overflow (2 ^ 32, or Integer.MAX_INT + 1)
             # Reproduces #7914
-            # NYH
-            #assert_invalid_throw_message(cql, table, "Expected an int value, but got a", FunctionFailure,
-            #    "INSERT INTO %s (k, intval) VALUES (?, fromJson(?))", 0, "2147483648")
+            assert_invalid_throw_message(cql, table, "Expected an int value, but got a", FunctionFailure,
+                "INSERT INTO %s (k, intval) VALUES (?, fromJson(?))", 0, "2147483648")
 
             # Reproduces #7911
             assert_invalid_throw(cql, table, FunctionFailure,
@@ -392,9 +390,8 @@ def testFromJsonFct(cql, test_keyspace):
 
             # smallint overflow (Short.MAX_VALUE + 1)
             # Reproduces #7914
-            # NYH
-            #assert_invalid_throw_message(cql, table, "Unable to make short from", FunctionFailure,
-            #    "INSERT INTO %s (k, smallintval) VALUES (?, fromJson(?))", 0, "32768")
+            assert_invalid_throw_message(cql, table, "Unable to make short from", FunctionFailure,
+                "INSERT INTO %s (k, smallintval) VALUES (?, fromJson(?))", 0, "32768")
 
             # Reproduces #7911
             assert_invalid_throw(cql, table, FunctionFailure,
@@ -402,7 +399,7 @@ def testFromJsonFct(cql, test_keyspace):
             assert_invalid_throw(cql, table, FunctionFailure,
                 "INSERT INTO %s (k, smallintval) VALUES (?, fromJson(?))", 0, "\"xyzz\"")
             assert_invalid_throw(cql, table, FunctionFailure,
-                "INSERT INTO %s (k, smallintval) VALUES (?, fromJson(?))", 0, "true");
+                "INSERT INTO %s (k, smallintval) VALUES (?, fromJson(?))", 0, "true")
 
             # ================ tinyint ================
             execute(cql, table, "INSERT INTO %s (k, tinyintval) VALUES (?, fromJson(?))", 0, "127")
@@ -414,9 +411,8 @@ def testFromJsonFct(cql, test_keyspace):
 
             # tinyint overflow (Byte.MAX_VALUE + 1)
             # Reproduces #7914
-            # NYH
-            #assert_invalid_throw_message(cql, table, "Unable to make byte from", FunctionFailure,
-            #    "INSERT INTO %s (k, tinyintval) VALUES (?, fromJson(?))", 0, "128")
+            assert_invalid_throw_message(cql, table, "Unable to make byte from", FunctionFailure,
+                "INSERT INTO %s (k, tinyintval) VALUES (?, fromJson(?))", 0, "128")
 
             # Reproduces #7911
             assert_invalid_throw(cql, table, FunctionFailure,
@@ -441,7 +437,7 @@ def testFromJsonFct(cql, test_keyspace):
 
             # Reproduces #7911
             assert_invalid_throw(cql, table, FunctionFailure,
-                "INSERT INTO %s (k, textval) VALUES (?, fromJson(?))", 0, "123");
+                "INSERT INTO %s (k, textval) VALUES (?, fromJson(?))", 0, "123")
 
             # ================ time ================
             execute(cql, table, "INSERT INTO %s (k, timeval) VALUES (?, fromJson(?))", 0, "\"07:35:07.000111222\"")
@@ -449,12 +445,12 @@ def testFromJsonFct(cql, test_keyspace):
 
             # Reproduces #7911
             assert_invalid_throw(cql, table, FunctionFailure,
-                "INSERT INTO %s (k, timeval) VALUES (?, fromJson(?))", 0, "123456");
+                "INSERT INTO %s (k, timeval) VALUES (?, fromJson(?))", 0, "123456")
             assert_invalid_throw(cql, table, FunctionFailure,
                 "INSERT INTO %s (k, timeval) VALUES (?, fromJson(?))", 0, "\"xyz\"")
 
             # ================ timestamp ================
-            execute(cql, table, "INSERT INTO %s (k, timestampval) VALUES (?, fromJson(?))", 0, "123123123123");
+            execute(cql, table, "INSERT INTO %s (k, timestampval) VALUES (?, fromJson(?))", 0, "123123123123")
             assert_rows(execute(cql, table, "SELECT k, timestampval FROM %s WHERE k = ?", 0), [0, datetime.utcfromtimestamp(123123123123/1e3)])
 
             execute(cql, table, "INSERT INTO %s (k, timestampval) VALUES (?, fromJson(?))", 0, "\"2014-01-01\"")
@@ -465,208 +461,244 @@ def testFromJsonFct(cql, test_keyspace):
             # appears to do the right thing...
             assert_rows(execute(cql, table, "SELECT k, timestampval FROM %s WHERE k = ?", 0), [0, datetime.utcfromtimestamp(datetime(2014, 1, 1, 0, 0, 0).timestamp())])
             assert_invalid_throw(cql, table, FunctionFailure,
-                "INSERT INTO %s (k, timestampval) VALUES (?, fromJson(?))", 0, "123.456");
+                "INSERT INTO %s (k, timestampval) VALUES (?, fromJson(?))", 0, "123.456")
             assert_invalid_throw(cql, table, FunctionFailure,
-                "INSERT INTO %s (k, timestampval) VALUES (?, fromJson(?))", 0, "\"abcd\"");
+                "INSERT INTO %s (k, timestampval) VALUES (?, fromJson(?))", 0, "\"abcd\"")
 
-"""
-        // ================ timeuuid ================
-        execute("INSERT INTO %s (k, timeuuidval) VALUES (?, fromJson(?))", 0, "\"6bddc89a-5644-11e4-97fc-56847afe9799\"");
-        assertRows(execute("SELECT k, timeuuidval FROM %s WHERE k = ?", 0), row(0, UUID.fromString("6bddc89a-5644-11e4-97fc-56847afe9799")));
+            # ================ timeuuid ================
+            execute(cql, table, "INSERT INTO %s (k, timeuuidval) VALUES (?, fromJson(?))", 0, "\"6bddc89a-5644-11e4-97fc-56847afe9799\"")
+            assert_rows(execute(cql, table, "SELECT k, timeuuidval FROM %s WHERE k = ?", 0), [0, UUID("6bddc89a-5644-11e4-97fc-56847afe9799")])
 
-        execute("INSERT INTO %s (k, timeuuidval) VALUES (?, fromJson(?))", 0, "\"6BDDC89A-5644-11E4-97FC-56847AFE9799\"");
-        assertRows(execute("SELECT k, timeuuidval FROM %s WHERE k = ?", 0), row(0, UUID.fromString("6bddc89a-5644-11e4-97fc-56847afe9799")));
+            execute(cql, table, "INSERT INTO %s (k, timeuuidval) VALUES (?, fromJson(?))", 0, "\"6BDDC89A-5644-11E4-97FC-56847AFE9799\"")
+            assert_rows(execute(cql, table, "SELECT k, timeuuidval FROM %s WHERE k = ?", 0), [0, UUID("6bddc89a-5644-11e4-97fc-56847afe9799")])
 
-        assertInvalidMessage("TimeUUID supports only version 1 UUIDs",
-                "INSERT INTO %s (k, timeuuidval) VALUES (?, fromJson(?))", 0, "\"00000000-0000-0000-0000-000000000000\"");
+            assert_invalid_throw(cql, table, FunctionFailure,
+                "INSERT INTO %s (k, timeuuidval) VALUES (?, fromJson(?))", 0, "\"00000000-0000-0000-0000-000000000000\"")
 
-        assertInvalidMessage("Expected a string representation of a timeuuid, but got a Integer",
-                "INSERT INTO %s (k, timeuuidval) VALUES (?, fromJson(?))", 0, "123");
+            assert_invalid_throw(cql, table, FunctionFailure,
+                "INSERT INTO %s (k, timeuuidval) VALUES (?, fromJson(?))", 0, "123")
 
-         // ================ uuidval ================
-        execute("INSERT INTO %s (k, uuidval) VALUES (?, fromJson(?))", 0, "\"6bddc89a-5644-11e4-97fc-56847afe9799\"");
-        assertRows(execute("SELECT k, uuidval FROM %s WHERE k = ?", 0), row(0, UUID.fromString("6bddc89a-5644-11e4-97fc-56847afe9799")));
+             # ================ uuidval ================
+            execute(cql, table, "INSERT INTO %s (k, uuidval) VALUES (?, fromJson(?))", 0, "\"6bddc89a-5644-11e4-97fc-56847afe9799\"")
+            assert_rows(execute(cql, table, "SELECT k, uuidval FROM %s WHERE k = ?", 0), [0, UUID("6bddc89a-5644-11e4-97fc-56847afe9799")])
 
-        execute("INSERT INTO %s (k, uuidval) VALUES (?, fromJson(?))", 0, "\"6BDDC89A-5644-11E4-97FC-56847AFE9799\"");
-        assertRows(execute("SELECT k, uuidval FROM %s WHERE k = ?", 0), row(0, UUID.fromString("6bddc89a-5644-11e4-97fc-56847afe9799")));
+            execute(cql, table, "INSERT INTO %s (k, uuidval) VALUES (?, fromJson(?))", 0, "\"6BDDC89A-5644-11E4-97FC-56847AFE9799\"")
+            assert_rows(execute(cql, table, "SELECT k, uuidval FROM %s WHERE k = ?", 0), [0, UUID("6bddc89a-5644-11e4-97fc-56847afe9799")])
 
-        assertInvalidMessage("Unable to make UUID from",
-                "INSERT INTO %s (k, uuidval) VALUES (?, fromJson(?))", 0, "\"00000000-0000-0000-zzzz-000000000000\"");
+            assert_invalid_throw(cql, table, FunctionFailure,
+                "INSERT INTO %s (k, uuidval) VALUES (?, fromJson(?))", 0, "\"00000000-0000-0000-zzzz-000000000000\"")
 
-        assertInvalidMessage("Expected a string representation of a uuid, but got a Integer",
-                "INSERT INTO %s (k, uuidval) VALUES (?, fromJson(?))", 0, "123");
+            assert_invalid_throw(cql, table, FunctionFailure,
+                "INSERT INTO %s (k, uuidval) VALUES (?, fromJson(?))", 0, "123")
 
-        // ================ varint ================
-        execute("INSERT INTO %s (k, varintval) VALUES (?, fromJson(?))", 0, "123123123123");
-        assertRows(execute("SELECT k, varintval FROM %s WHERE k = ?", 0), row(0, new BigInteger("123123123123")));
+            # ================ varint ================
+            execute(cql, table, "INSERT INTO %s (k, varintval) VALUES (?, fromJson(?))", 0, "123123123123")
+            assert_rows(execute(cql, table, "SELECT k, varintval FROM %s WHERE k = ?", 0), [0, 123123123123])
 
-        // accept strings for numbers that cannot be represented as longs
-        execute("INSERT INTO %s (k, varintval) VALUES (?, fromJson(?))", 0, "\"1234567890123456789012345678901234567890\"");
-        assertRows(execute("SELECT k, varintval FROM %s WHERE k = ?", 0), row(0, new BigInteger("1234567890123456789012345678901234567890")));
+            # accept strings for numbers that cannot be represented as longs
+            execute(cql, table, "INSERT INTO %s (k, varintval) VALUES (?, fromJson(?))", 0, "\"1234567890123456789012345678901234567890\"")
+            assert_rows(execute(cql, table, "SELECT k, varintval FROM %s WHERE k = ?", 0), [0, 1234567890123456789012345678901234567890])
 
-        assertInvalidMessage("Value '123123.123' is not a valid representation of a varint value",
-                "INSERT INTO %s (k, varintval) VALUES (?, fromJson(?))", 0, "123123.123");
+            assert_invalid_throw(cql, table, FunctionFailure,
+                "INSERT INTO %s (k, varintval) VALUES (?, fromJson(?))", 0, "123123.123")
 
-        assertInvalidMessage("Value 'xyzz' is not a valid representation of a varint value",
-                "INSERT INTO %s (k, varintval) VALUES (?, fromJson(?))", 0, "\"xyzz\"");
+            assert_invalid_throw(cql, table, FunctionFailure,
+                "INSERT INTO %s (k, varintval) VALUES (?, fromJson(?))", 0, "\"xyzz\"")
 
-        assertInvalidMessage("Value '' is not a valid representation of a varint value",
-                "INSERT INTO %s (k, varintval) VALUES (?, fromJson(?))", 0, "\"\"");
+            # reproduces #7944
+            assert_invalid_throw(cql, table, FunctionFailure,
+                "INSERT INTO %s (k, varintval) VALUES (?, fromJson(?))", 0, "\"\"")
 
-        assertInvalidMessage("Value 'true' is not a valid representation of a varint value",
-                "INSERT INTO %s (k, varintval) VALUES (?, fromJson(?))", 0, "true");
+            assert_invalid_throw(cql, table, FunctionFailure,
+                "INSERT INTO %s (k, varintval) VALUES (?, fromJson(?))", 0, "true")
 
-        // ================ lists ================
-        execute("INSERT INTO %s (k, listval) VALUES (?, fromJson(?))", 0, "[1, 2, 3]");
-        assertRows(execute("SELECT k, listval FROM %s WHERE k = ?", 0), row(0, list(1, 2, 3)));
+            # ================ lists ================
+            execute(cql, table, "INSERT INTO %s (k, listval) VALUES (?, fromJson(?))", 0, "[1, 2, 3]")
+            assert_rows(execute(cql, table, "SELECT k, listval FROM %s WHERE k = ?", 0), [0, [1, 2, 3]])
 
-        execute("INSERT INTO %s (k, listval) VALUES (?, fromJson(?))", 0, "[]");
-        assertRows(execute("SELECT k, listval FROM %s WHERE k = ?", 0), row(0, null));
+            execute(cql, table, "INSERT INTO %s (k, listval) VALUES (?, fromJson(?))", 0, "[]")
+            assert_rows(execute(cql, table, "SELECT k, listval FROM %s WHERE k = ?", 0), [0, None])
 
-        assertInvalidMessage("Expected a list, but got a Integer",
-                "INSERT INTO %s (k, listval) VALUES (?, fromJson(?))", 0, "123");
+            assert_invalid_throw(cql, table, FunctionFailure,
+                "INSERT INTO %s (k, listval) VALUES (?, fromJson(?))", 0, "123")
 
-        assertInvalidMessage("Unable to make int from",
-                "INSERT INTO %s (k, listval) VALUES (?, fromJson(?))", 0, "[\"abc\"]");
+            assert_invalid_throw(cql, table, FunctionFailure,
+                "INSERT INTO %s (k, listval) VALUES (?, fromJson(?))", 0, "[\"abc\"]")
 
-        assertInvalidMessage("Invalid null element in list",
-                "INSERT INTO %s (k, listval) VALUES (?, fromJson(?))", 0, "[null]");
+            assert_invalid_throw(cql, table, FunctionFailure,
+                "INSERT INTO %s (k, listval) VALUES (?, fromJson(?))", 0, "[null]")
 
-        // frozen
-        execute("INSERT INTO %s (k, frozenlistval) VALUES (?, fromJson(?))", 0, "[1, 2, 3]");
-        assertRows(execute("SELECT k, frozenlistval FROM %s WHERE k = ?", 0), row(0, list(1, 2, 3)));
+            # frozen
+            execute(cql, table, "INSERT INTO %s (k, frozenlistval) VALUES (?, fromJson(?))", 0, "[1, 2, 3]")
+            assert_rows(execute(cql, table, "SELECT k, frozenlistval FROM %s WHERE k = ?", 0), [0, [1, 2, 3]])
 
-        // ================ sets ================
-        execute("INSERT INTO %s (k, setval) VALUES (?, fromJson(?))",
-                0, "[\"6bddc89a-5644-11e4-97fc-56847afe9798\", \"6bddc89a-5644-11e4-97fc-56847afe9799\"]");
-        assertRows(execute("SELECT k, setval FROM %s WHERE k = ?", 0),
-                row(0, set(UUID.fromString("6bddc89a-5644-11e4-97fc-56847afe9798"), (UUID.fromString("6bddc89a-5644-11e4-97fc-56847afe9799"))))
-        );
+            # ================ sets ================
+            execute(cql, table, "INSERT INTO %s (k, setval) VALUES (?, fromJson(?))",
+                0, "[\"6bddc89a-5644-11e4-97fc-56847afe9798\", \"6bddc89a-5644-11e4-97fc-56847afe9799\"]")
+            assert_rows(execute(cql, table, "SELECT k, setval FROM %s WHERE k = ?", 0),
+                [0, {UUID("6bddc89a-5644-11e4-97fc-56847afe9798"), (UUID("6bddc89a-5644-11e4-97fc-56847afe9799"))}])
 
-        // duplicates are okay, just like in CQL
-        execute("INSERT INTO %s (k, setval) VALUES (?, fromJson(?))",
-                0, "[\"6bddc89a-5644-11e4-97fc-56847afe9798\", \"6bddc89a-5644-11e4-97fc-56847afe9798\", \"6bddc89a-5644-11e4-97fc-56847afe9799\"]");
-        assertRows(execute("SELECT k, setval FROM %s WHERE k = ?", 0),
-                row(0, set(UUID.fromString("6bddc89a-5644-11e4-97fc-56847afe9798"), (UUID.fromString("6bddc89a-5644-11e4-97fc-56847afe9799"))))
-        );
+            # duplicates are okay, just like in CQL
+            execute(cql, table, "INSERT INTO %s (k, setval) VALUES (?, fromJson(?))",
+                0, "[\"6bddc89a-5644-11e4-97fc-56847afe9798\", \"6bddc89a-5644-11e4-97fc-56847afe9798\", \"6bddc89a-5644-11e4-97fc-56847afe9799\"]")
+            assert_rows(execute(cql, table, "SELECT k, setval FROM %s WHERE k = ?", 0),
+                [0, {UUID("6bddc89a-5644-11e4-97fc-56847afe9798"), (UUID("6bddc89a-5644-11e4-97fc-56847afe9799"))}])
 
-        execute("INSERT INTO %s (k, setval) VALUES (?, fromJson(?))", 0, "[]");
-        assertRows(execute("SELECT k, setval FROM %s WHERE k = ?", 0), row(0, null));
+            execute(cql, table, "INSERT INTO %s (k, setval) VALUES (?, fromJson(?))", 0, "[]")
+            assert_rows(execute(cql, table, "SELECT k, setval FROM %s WHERE k = ?", 0), [0, None])
 
-        assertInvalidMessage("Expected a list (representing a set), but got a Integer",
-                "INSERT INTO %s (k, setval) VALUES (?, fromJson(?))", 0, "123");
+            assert_invalid_throw(cql, table, FunctionFailure,
+                "INSERT INTO %s (k, setval) VALUES (?, fromJson(?))", 0, "123")
 
-        assertInvalidMessage("Unable to make UUID from",
-                "INSERT INTO %s (k, setval) VALUES (?, fromJson(?))", 0, "[\"abc\"]");
+            assert_invalid_throw(cql, table, FunctionFailure,
+                "INSERT INTO %s (k, setval) VALUES (?, fromJson(?))", 0, "[\"abc\"]")
 
-        assertInvalidMessage("Invalid null element in set",
-                "INSERT INTO %s (k, setval) VALUES (?, fromJson(?))", 0, "[null]");
+            assert_invalid_throw(cql, table, FunctionFailure,
+                "INSERT INTO %s (k, setval) VALUES (?, fromJson(?))", 0, "[null]")
 
-        // frozen
-        execute("INSERT INTO %s (k, frozensetval) VALUES (?, fromJson(?))",
-                0, "[\"6bddc89a-5644-11e4-97fc-56847afe9798\", \"6bddc89a-5644-11e4-97fc-56847afe9799\"]");
-        assertRows(execute("SELECT k, frozensetval FROM %s WHERE k = ?", 0),
-                row(0, set(UUID.fromString("6bddc89a-5644-11e4-97fc-56847afe9798"), (UUID.fromString("6bddc89a-5644-11e4-97fc-56847afe9799"))))
-        );
+            # frozen
+            execute(cql, table, "INSERT INTO %s (k, frozensetval) VALUES (?, fromJson(?))",
+                0, "[\"6bddc89a-5644-11e4-97fc-56847afe9798\", \"6bddc89a-5644-11e4-97fc-56847afe9799\"]")
+            assert_rows(execute(cql, table, "SELECT k, frozensetval FROM %s WHERE k = ?", 0),
+                [0, {UUID("6bddc89a-5644-11e4-97fc-56847afe9798"), (UUID("6bddc89a-5644-11e4-97fc-56847afe9799"))}])
 
-        execute("INSERT INTO %s (k, frozensetval) VALUES (?, fromJson(?))",
-                0, "[\"6bddc89a-5644-11e4-97fc-56847afe9799\", \"6bddc89a-5644-11e4-97fc-56847afe9798\"]");
-        assertRows(execute("SELECT k, frozensetval FROM %s WHERE k = ?", 0),
-                row(0, set(UUID.fromString("6bddc89a-5644-11e4-97fc-56847afe9798"), (UUID.fromString("6bddc89a-5644-11e4-97fc-56847afe9799"))))
-        );
+            execute(cql, table, "INSERT INTO %s (k, frozensetval) VALUES (?, fromJson(?))",
+                0, "[\"6bddc89a-5644-11e4-97fc-56847afe9799\", \"6bddc89a-5644-11e4-97fc-56847afe9798\"]")
+            assert_rows(execute(cql, table, "SELECT k, frozensetval FROM %s WHERE k = ?", 0),
+                [0, {UUID("6bddc89a-5644-11e4-97fc-56847afe9798"), (UUID("6bddc89a-5644-11e4-97fc-56847afe9799"))}])
 
-        // ================ maps ================
-        execute("INSERT INTO %s (k, mapval) VALUES (?, fromJson(?))", 0, "{\"a\": 1, \"b\": 2}");
-        assertRows(execute("SELECT k, mapval FROM %s WHERE k = ?", 0), row(0, map("a", 1, "b", 2)));
+            # ================ maps ================
+            # Reproduces #7949:
+            execute(cql, table, "INSERT INTO %s (k, mapval) VALUES (?, fromJson(?))", 0, "{\"a\": 1, \"b\": 2}")
+            assert_rows(execute(cql, table, "SELECT k, mapval FROM %s WHERE k = ?", 0), [0, {"a": 1, "b": 2}])
 
-        execute("INSERT INTO %s (k, mapval) VALUES (?, fromJson(?))", 0, "{}");
-        assertRows(execute("SELECT k, mapval FROM %s WHERE k = ?", 0), row(0, null));
+            execute(cql, table, "INSERT INTO %s (k, mapval) VALUES (?, fromJson(?))", 0, "{}")
+            assert_rows(execute(cql, table, "SELECT k, mapval FROM %s WHERE k = ?", 0), [0, None])
 
-        assertInvalidMessage("Expected a map, but got a Integer",
-                "INSERT INTO %s (k, mapval) VALUES (?, fromJson(?))", 0, "123");
+            assert_invalid_throw(cql, table, FunctionFailure,
+                "INSERT INTO %s (k, mapval) VALUES (?, fromJson(?))", 0, "123")
 
-        assertInvalidMessage("Invalid ASCII character in string literal",
-                "INSERT INTO %s (k, mapval) VALUES (?, fromJson(?))", 0, "{\"\\u1fff\\u2013\\u33B4\\u2014\": 1}");
+            assert_invalid_throw(cql, table, FunctionFailure,
+                "INSERT INTO %s (k, mapval) VALUES (?, fromJson(?))", 0, "{\"\\u1fff\\u2013\\u33B4\\u2014\": 1}")
 
-        assertInvalidMessage("Invalid null value in map",
-                "INSERT INTO %s (k, mapval) VALUES (?, fromJson(?))", 0, "{\"a\": null}");
+            assert_invalid_throw(cql, table, FunctionFailure,
+                "INSERT INTO %s (k, mapval) VALUES (?, fromJson(?))", 0, "{\"a\": null}")
 
-        // frozen
-        execute("INSERT INTO %s (k, frozenmapval) VALUES (?, fromJson(?))", 0, "{\"a\": 1, \"b\": 2}");
-        assertRows(execute("SELECT k, frozenmapval FROM %s WHERE k = ?", 0), row(0, map("a", 1, "b", 2)));
+            # frozen
+            # Reproduces #7949:
+            execute(cql, table, "INSERT INTO %s (k, frozenmapval) VALUES (?, fromJson(?))", 0, "{\"a\": 1, \"b\": 2}")
+            assert_rows(execute(cql, table, "SELECT k, frozenmapval FROM %s WHERE k = ?", 0), [0, {"a": 1, "b": 2}])
+            execute(cql, table, "INSERT INTO %s (k, frozenmapval) VALUES (?, fromJson(?))", 0, "{\"b\": 2, \"a\": 1}")
+            assert_rows(execute(cql, table, "SELECT k, frozenmapval FROM %s WHERE k = ?", 0), [0, {"a": 1, "b": 2}])
 
-        execute("INSERT INTO %s (k, frozenmapval) VALUES (?, fromJson(?))", 0, "{\"b\": 2, \"a\": 1}");
-        assertRows(execute("SELECT k, frozenmapval FROM %s WHERE k = ?", 0), row(0, map("a", 1, "b", 2)));
+            # ================ tuples ================
+            execute(cql, table, "INSERT INTO %s (k, tupleval) VALUES (?, fromJson(?))", 0, "[1, \"foobar\", \"6bddc89a-5644-11e4-97fc-56847afe9799\"]")
+            assert_rows(execute(cql, table, "SELECT k, tupleval FROM %s WHERE k = ?", 0),
+                [0, (1, "foobar", UUID("6bddc89a-5644-11e4-97fc-56847afe9799"))])
 
-        // ================ tuples ================
-        execute("INSERT INTO %s (k, tupleval) VALUES (?, fromJson(?))", 0, "[1, \"foobar\", \"6bddc89a-5644-11e4-97fc-56847afe9799\"]");
-        assertRows(execute("SELECT k, tupleval FROM %s WHERE k = ?", 0),
-            row(0, tuple(1, "foobar", UUID.fromString("6bddc89a-5644-11e4-97fc-56847afe9799")))
-        );
+            # Reproduces #7954:
+            execute(cql, table, "INSERT INTO %s (k, tupleval) VALUES (?, fromJson(?))", 0, "[1, null, \"6bddc89a-5644-11e4-97fc-56847afe9799\"]")
+            assert_rows(execute(cql, table, "SELECT k, tupleval FROM %s WHERE k = ?", 0),
+                [0, (1, None, UUID("6bddc89a-5644-11e4-97fc-56847afe9799"))])
 
-        execute("INSERT INTO %s (k, tupleval) VALUES (?, fromJson(?))", 0, "[1, null, \"6bddc89a-5644-11e4-97fc-56847afe9799\"]");
-        assertRows(execute("SELECT k, tupleval FROM %s WHERE k = ?", 0),
-                row(0, tuple(1, null, UUID.fromString("6bddc89a-5644-11e4-97fc-56847afe9799")))
-        );
-
-        assertInvalidMessage("Tuple contains extra items",
+            assert_invalid_throw(cql, table, FunctionFailure,
                 "INSERT INTO %s (k, tupleval) VALUES (?, fromJson(?))",
-                0, "[1, \"foobar\", \"6bddc89a-5644-11e4-97fc-56847afe9799\", 1, 2, 3]");
+                0, "[1, \"foobar\", \"6bddc89a-5644-11e4-97fc-56847afe9799\", 1, 2, 3]")
 
-        assertInvalidMessage("Tuple is missing items",
+            assert_invalid_throw(cql, table, FunctionFailure,
                 "INSERT INTO %s (k, tupleval) VALUES (?, fromJson(?))",
-                0, "[1, \"foobar\"]");
+                0, "[1, \"foobar\"]")
 
-        assertInvalidMessage("Unable to make int from",
+            assert_invalid_throw(cql, table, FunctionFailure,
                 "INSERT INTO %s (k, tupleval) VALUES (?, fromJson(?))",
-                0, "[\"not an int\", \"foobar\", \"6bddc89a-5644-11e4-97fc-56847afe9799\"]");
+                0, "[\"not an int\", \"foobar\", \"6bddc89a-5644-11e4-97fc-56847afe9799\"]")
 
-        // ================ UDTs ================
-        execute("INSERT INTO %s (k, udtval) VALUES (?, fromJson(?))", 0, "{\"a\": 1, \"b\": \"6bddc89a-5644-11e4-97fc-56847afe9799\", \"c\": [\"foo\", \"bar\"]}");
-        assertRows(execute("SELECT k, udtval.a, udtval.b, udtval.c FROM %s WHERE k = ?", 0),
-                row(0, 1, UUID.fromString("6bddc89a-5644-11e4-97fc-56847afe9799"), set("bar", "foo"))
-        );
+            # ================ UDTs ================
+            execute(cql, table, "INSERT INTO %s (k, udtval) VALUES (?, fromJson(?))", 0, "{\"a\": 1, \"b\": \"6bddc89a-5644-11e4-97fc-56847afe9799\", \"c\": [\"foo\", \"bar\"]}")
+            assert_rows(execute(cql, table, "SELECT k, udtval.a, udtval.b, udtval.c FROM %s WHERE k = ?", 0),
+                [0, 1, UUID("6bddc89a-5644-11e4-97fc-56847afe9799"), {"bar", "foo"}])
 
-        // ================ duration ================
-        execute("INSERT INTO %s (k, durationval) VALUES (?, fromJson(?))", 0, "\"53us\"");
-        assertRows(execute("SELECT k, durationval FROM %s WHERE k = ?", 0), row(0, Duration.newInstance(0, 0, 53000L)));
+            # ================ duration ================
+            execute(cql, table, "INSERT INTO %s (k, durationval) VALUES (?, fromJson(?))", 0, "\"53us\"")
+            assert_rows(execute(cql, table, "SELECT k, durationval FROM %s WHERE k = ?", 0), [0, Duration(0, 0, 53000)])
 
-        execute("INSERT INTO %s (k, durationval) VALUES (?, fromJson(?))", 0, "\"P2W\"");
-        assertRows(execute("SELECT k, durationval FROM %s WHERE k = ?", 0), row(0, Duration.newInstance(0, 14, 0)));
+            execute(cql, table, "INSERT INTO %s (k, durationval) VALUES (?, fromJson(?))", 0, "\"P2W\"")
+            assert_rows(execute(cql, table,"SELECT k, durationval FROM %s WHERE k = ?", 0), [0, Duration(0, 14, 0)])
 
-        assertInvalidMessage("Unable to convert 'xyz' to a duration",
-                             "INSERT INTO %s (k, durationval) VALUES (?, fromJson(?))", 0, "\"xyz\"");
+            # Unlike all the other cases of unsuccessful fromJson() parsing which return FunctionFailure,
+            # in this specific case Cassandra returns InvalidQuery. I don't know why, and I don't think
+            # Scylla needs to reproduce this ideosyncracy. So let's allow both.
+            assert_invalid_throw(cql, table, (FunctionFailure, InvalidRequest),
+                "INSERT INTO %s (k, durationval) VALUES (?, fromJson(?))", 0, "\"xyz\"")
 
-        // order of fields shouldn't matter
-        execute("INSERT INTO %s (k, udtval) VALUES (?, fromJson(?))", 0, "{\"b\": \"6bddc89a-5644-11e4-97fc-56847afe9799\", \"a\": 1, \"c\": [\"foo\", \"bar\"]}");
-        assertRows(execute("SELECT k, udtval.a, udtval.b, udtval.c FROM %s WHERE k = ?", 0),
-                row(0, 1, UUID.fromString("6bddc89a-5644-11e4-97fc-56847afe9799"), set("bar", "foo"))
-        );
+            # order of fields shouldn't matter
+            execute(cql, table, "INSERT INTO %s (k, udtval) VALUES (?, fromJson(?))", 0, "{\"b\": \"6bddc89a-5644-11e4-97fc-56847afe9799\", \"a\": 1, \"c\": [\"foo\", \"bar\"]}")
+            assert_rows(execute(cql, table, "SELECT k, udtval.a, udtval.b, udtval.c FROM %s WHERE k = ?", 0),
+                [0, 1, UUID("6bddc89a-5644-11e4-97fc-56847afe9799"), {"bar", "foo"}])
 
-        // test nulls
-        execute("INSERT INTO %s (k, udtval) VALUES (?, fromJson(?))", 0, "{\"a\": null, \"b\": \"6bddc89a-5644-11e4-97fc-56847afe9799\", \"c\": [\"foo\", \"bar\"]}");
-        assertRows(execute("SELECT k, udtval.a, udtval.b, udtval.c FROM %s WHERE k = ?", 0),
-                row(0, null, UUID.fromString("6bddc89a-5644-11e4-97fc-56847afe9799"), set("bar", "foo"))
-        );
+            # test nulls
+            execute(cql, table, "INSERT INTO %s (k, udtval) VALUES (?, fromJson(?))", 0, "{\"a\": null, \"b\": \"6bddc89a-5644-11e4-97fc-56847afe9799\", \"c\": [\"foo\", \"bar\"]}")
+            assert_rows(execute(cql, table, "SELECT k, udtval.a, udtval.b, udtval.c FROM %s WHERE k = ?", 0),
+                [0, None, UUID("6bddc89a-5644-11e4-97fc-56847afe9799"), {"bar", "foo"}])
 
-        // test missing fields
-        execute("INSERT INTO %s (k, udtval) VALUES (?, fromJson(?))", 0, "{\"a\": 1, \"b\": \"6bddc89a-5644-11e4-97fc-56847afe9799\"}");
-        assertRows(execute("SELECT k, udtval.a, udtval.b, udtval.c FROM %s WHERE k = ?", 0),
-                row(0, 1, UUID.fromString("6bddc89a-5644-11e4-97fc-56847afe9799"), null)
-        );
+            # test missing fields
+            execute(cql, table, "INSERT INTO %s (k, udtval) VALUES (?, fromJson(?))", 0, "{\"a\": 1, \"b\": \"6bddc89a-5644-11e4-97fc-56847afe9799\"}")
+            assert_rows(execute(cql, table, "SELECT k, udtval.a, udtval.b, udtval.c FROM %s WHERE k = ?", 0),
+                [0, 1, UUID("6bddc89a-5644-11e4-97fc-56847afe9799"), None])
 
-        assertInvalidMessage("Unknown field", "INSERT INTO %s (k, udtval) VALUES (?, fromJson(?))", 0, "{\"xxx\": 1}");
-        assertInvalidMessage("Unable to make int from",
-                "INSERT INTO %s (k, udtval) VALUES (?, fromJson(?))", 0, "{\"a\": \"foobar\"}");
-    }
+            assert_invalid_throw(cql, table, FunctionFailure,
+                "INSERT INTO %s (k, udtval) VALUES (?, fromJson(?))", 0, "{\"xxx\": 1}")
+            assert_invalid_throw(cql, table, FunctionFailure,
+                "INSERT INTO %s (k, udtval) VALUES (?, fromJson(?))", 0, "{\"a\": \"foobar\"}")
 
-"""
-"""
-    @Test
-    public void testToJsonFct() throws Throwable
-    {
-        String typeName = createType("CREATE TYPE %s (a int, b uuid, c set<text>)");
-        createTable("CREATE TABLE %s (" +
+# The following test will check the output of Cassandra's and Scylla's toJson()
+# function, which converts various types to JSON. However, obviously there is
+# more than one correct way to format the same JSON object, so in many cases
+# we cannot, and don't want to, expect the exact same string to be returned by
+# Scylla and Cassandra. For this we have the following class. It wraps
+# a JSON string, and compare equal to other strings if both are valid JSON
+# strings which decode to the same object. EquivalentJson("....") can be used
+# in assert_rows() checks below, to check whether functionally-equivalent JSON
+# is returned instead of checking for identical strings.
+class EquivalentJson:
+    def __init__(self, s):
+        self.obj = json.loads(s)
+    def __eq__(self, other):
+        if isinstance(other, EquivalentJson):
+            return self.obj == other.obj
+        elif isinstance(other, str):
+            return self.obj == json.loads(other)
+        return NotImplemented
+    # Implementing __repr__ is useful because when a comparison fails, pytest
+    # helpfully prints what it tried to compare, and uses __repr__ for that.
+    def __repr__(self):
+        return f'EquivalentJson("{self.obj}")'
+
+# Similarly, EquivalentIp compares two JSON strings which are supposed to
+# contain an IP address. For example, "::1" and "0:0:0:0:0:0:0:1" are
+# equivalent.
+class EquivalentIp:
+    def __init__(self, s):
+        self.obj = json.loads(s)
+    def __eq__(self, other):
+        if isinstance(other, EquivalentIp):
+            otherobj = other.obj
+        elif isinstance(other, str):
+            otherobj = json.loads(other)
+        else:
+            return NotImplemented
+        if self.obj == otherobj:
+            return True
+        return getaddrinfo(self.obj, 0) == getaddrinfo(otherobj, 0)
+    def __repr__(self):
+        return f'EquivalentIp("{self.obj}")'
+
+# Reproduces issue #7972, #7988, #7997, #8001
+@pytest.mark.xfail(reason="issues #7972, #7988, #7997, #8001")
+def testToJsonFct(cql, test_keyspace):
+    abc_tuple = collections.namedtuple('abc_tuple', ['a', 'b', 'c'])
+    with create_type(cql, test_keyspace, "(a int, b uuid, c set<text>)") as type_name:
+        with create_table(cql, test_keyspace, "(" +
                 "k int PRIMARY KEY, " +
                 "asciival ascii, " +
                 "bigintval bigint, " +
@@ -691,220 +723,227 @@ def testFromJsonFct(cql, test_keyspace):
                 "frozenlistval frozen<list<int>>, " +
                 "setval set<uuid>, " +
                 "frozensetval frozen<set<uuid>>, " +
-                "mapval map<ascii, int>, " +
-                "frozenmapval frozen<map<ascii, int>>, " +
+                "mapval map<ascii, int>," +
+                "frozenmapval frozen<map<ascii, int>>," +
                 "tupleval frozen<tuple<int, ascii, uuid>>," +
-                "udtval frozen<" + typeName + ">," +
-                "durationval duration)");
+                "udtval frozen<" + type_name + ">," +
+                "durationval duration)") as table:
+            # toJson() can only be used in selections
+            # The error message is slightly different in Cassandra and in
+            # Scylla. It is "toJson() may only be used within the selection
+            # clause" in Cassandra, "toJson() is only valid in SELECT clause"
+            # in Scylla.
+            assert_invalid_message(cql, table, "clause",
+                "INSERT INTO %s (k, asciival) VALUES (?, toJson(?))", 0, 0)
+            assert_invalid_message(cql, table, "clause",
+                "UPDATE %s SET asciival = toJson(?) WHERE k = ?", 0, 0)
+            assert_invalid_message(cql, table, "clause",
+                "DELETE FROM %s WHERE k = fromJson(toJson(?))", 0)
 
-        // toJson() can only be used in selections
-        assertInvalidMessage("toJson() may only be used within the selection clause",
-                "INSERT INTO %s (k, asciival) VALUES (?, toJson(?))", 0, 0);
-        assertInvalidMessage("toJson() may only be used within the selection clause",
-                "UPDATE %s SET asciival = toJson(?) WHERE k = ?", 0, 0);
-        assertInvalidMessage("toJson() may only be used within the selection clause",
-                "DELETE FROM %s WHERE k = fromJson(toJson(?))", 0);
+            # ================ ascii ================
+            execute(cql, table, "INSERT INTO %s (k, asciival) VALUES (?, ?)", 0, "ascii text")
+            assert_rows(execute(cql, table, "SELECT k, toJson(asciival) FROM %s WHERE k = ?", 0), [0, "\"ascii text\""])
 
-        // ================ ascii ================
-        execute("INSERT INTO %s (k, asciival) VALUES (?, ?)", 0, "ascii text");
-        assertRows(execute("SELECT k, toJson(asciival) FROM %s WHERE k = ?", 0), row(0, "\"ascii text\""));
+            execute(cql, table, "INSERT INTO %s (k, asciival) VALUES (?, ?)", 0, "")
+            assert_rows(execute(cql, table, "SELECT k, toJson(asciival) FROM %s WHERE k = ?", 0), [0, "\"\""])
 
-        execute("INSERT INTO %s (k, asciival) VALUES (?, ?)", 0, "");
-        assertRows(execute("SELECT k, toJson(asciival) FROM %s WHERE k = ?", 0), row(0, "\"\""));
+            # ================ bigint ================
+            execute(cql, table, "INSERT INTO %s (k, bigintval) VALUES (?, ?)", 0, 123123123123)
+            assert_rows(execute(cql, table, "SELECT k, toJson(bigintval) FROM %s WHERE k = ?", 0), [0, "123123123123"])
 
-        // ================ bigint ================
-        execute("INSERT INTO %s (k, bigintval) VALUES (?, ?)", 0, 123123123123L);
-        assertRows(execute("SELECT k, toJson(bigintval) FROM %s WHERE k = ?", 0), row(0, "123123123123"));
+            execute(cql, table, "INSERT INTO %s (k, bigintval) VALUES (?, ?)", 0, 0)
+            assert_rows(execute(cql, table, "SELECT k, toJson(bigintval) FROM %s WHERE k = ?", 0), [0, "0"])
 
-        execute("INSERT INTO %s (k, bigintval) VALUES (?, ?)", 0, 0L);
-        assertRows(execute("SELECT k, toJson(bigintval) FROM %s WHERE k = ?", 0), row(0, "0"));
+            execute(cql, table, "INSERT INTO %s (k, bigintval) VALUES (?, ?)", 0, -123123123123)
+            assert_rows(execute(cql, table, "SELECT k, toJson(bigintval) FROM %s WHERE k = ?", 0), [0, "-123123123123"])
 
-        execute("INSERT INTO %s (k, bigintval) VALUES (?, ?)", 0, -123123123123L);
-        assertRows(execute("SELECT k, toJson(bigintval) FROM %s WHERE k = ?", 0), row(0, "-123123123123"));
+            # ================ blob ================
+            execute(cql, table, "INSERT INTO %s (k, blobval) VALUES (?, ?)", 0, bytearray([0,0,0,1]))
+            assert_rows(execute(cql, table, "SELECT k, toJson(blobval) FROM %s WHERE k = ?", 0), [0, "\"0x00000001\""])
 
-        // ================ blob ================
-        execute("INSERT INTO %s (k, blobval) VALUES (?, ?)", 0, ByteBufferUtil.bytes(1));
-        assertRows(execute("SELECT k, toJson(blobval) FROM %s WHERE k = ?", 0), row(0, "\"0x00000001\""));
+            execute(cql, table, "INSERT INTO %s (k, blobval) VALUES (?, ?)", 0, bytearray())
+            assert_rows(execute(cql, table, "SELECT k, toJson(blobval) FROM %s WHERE k = ?", 0), [0, "\"0x\""])
 
-        execute("INSERT INTO %s (k, blobval) VALUES (?, ?)", 0, ByteBufferUtil.EMPTY_BYTE_BUFFER);
-        assertRows(execute("SELECT k, toJson(blobval) FROM %s WHERE k = ?", 0), row(0, "\"0x\""));
+            # ================ boolean ================
+            execute(cql, table, "INSERT INTO %s (k, booleanval) VALUES (?, ?)", 0, True)
+            assert_rows(execute(cql, table, "SELECT k, toJson(booleanval) FROM %s WHERE k = ?", 0), [0, "true"])
 
-        // ================ boolean ================
-        execute("INSERT INTO %s (k, booleanval) VALUES (?, ?)", 0, true);
-        assertRows(execute("SELECT k, toJson(booleanval) FROM %s WHERE k = ?", 0), row(0, "true"));
+            execute(cql, table, "INSERT INTO %s (k, booleanval) VALUES (?, ?)", 0, False)
+            assert_rows(execute(cql, table, "SELECT k, toJson(booleanval) FROM %s WHERE k = ?", 0), [0, "false"])
 
-        execute("INSERT INTO %s (k, booleanval) VALUES (?, ?)", 0, false);
-        assertRows(execute("SELECT k, toJson(booleanval) FROM %s WHERE k = ?", 0), row(0, "false"));
+            # ================ date ================
+            execute(cql, table, "INSERT INTO %s (k, dateval) VALUES (?, ?)", 0, Date("1987-03-23"))
+            assert_rows(execute(cql, table, "SELECT k, toJson(dateval) FROM %s WHERE k = ?", 0), [0, "\"1987-03-23\""])
 
-        // ================ date ================
-        execute("INSERT INTO %s (k, dateval) VALUES (?, ?)", 0, SimpleDateSerializer.dateStringToDays("1987-03-23"));
-        assertRows(execute("SELECT k, toJson(dateval) FROM %s WHERE k = ?", 0), row(0, "\"1987-03-23\""));
+            # ================ decimal ================
+            execute(cql, table, "INSERT INTO %s (k, decimalval) VALUES (?, ?)", 0, Decimal("123123.123123"))
+            assert_rows(execute(cql, table, "SELECT k, toJson(decimalval) FROM %s WHERE k = ?", 0), [0, "123123.123123"])
 
-        // ================ decimal ================
-        execute("INSERT INTO %s (k, decimalval) VALUES (?, ?)", 0, new BigDecimal("123123.123123"));
-        assertRows(execute("SELECT k, toJson(decimalval) FROM %s WHERE k = ?", 0), row(0, "123123.123123"));
+            execute(cql, table, "INSERT INTO %s (k, decimalval) VALUES (?, ?)", 0, Decimal("-1.23E-12"))
+            # Scylla may print floating-point numbers with different choice
+            # of capitalization, exponent, etc, so we use EquivalentJson.
+            # Note that some representations may be equivalent, but
+            # objectively bad - see issue #80002.
+            assert_rows(execute(cql, table, "SELECT k, toJson(decimalval) FROM %s WHERE k = ?", 0), [0, EquivalentJson("-1.23E-12")])
 
-        execute("INSERT INTO %s (k, decimalval) VALUES (?, ?)", 0, new BigDecimal("-1.23E-12"));
-        assertRows(execute("SELECT k, toJson(decimalval) FROM %s WHERE k = ?", 0), row(0, "-1.23E-12"));
+            # ================ double ================
+            # Reproduces #7972:
+            execute(cql, table, "INSERT INTO %s (k, doubleval) VALUES (?, ?)", 0, 123123.123123)
+            assert_rows(execute(cql, table, "SELECT k, toJson(doubleval) FROM %s WHERE k = ?", 0), [0, "123123.123123"])
+            execute(cql, table, "INSERT INTO %s (k, doubleval) VALUES (?, ?)", 0, 123123)
+            assert_rows(execute(cql, table, "SELECT k, toJson(doubleval) FROM %s WHERE k = ?", 0), [0, "123123.0"])
 
-        // ================ double ================
-        execute("INSERT INTO %s (k, doubleval) VALUES (?, ?)", 0, 123123.123123d);
-        assertRows(execute("SELECT k, toJson(doubleval) FROM %s WHERE k = ?", 0), row(0, "123123.123123"));
+            # ================ float ================
+            execute(cql, table, "INSERT INTO %s (k, floatval) VALUES (?, ?)", 0, 123.123)
+            assert_rows(execute(cql, table, "SELECT k, toJson(floatval) FROM %s WHERE k = ?", 0), [0, "123.123"])
 
-        execute("INSERT INTO %s (k, doubleval) VALUES (?, ?)", 0, 123123d);
-        assertRows(execute("SELECT k, toJson(doubleval) FROM %s WHERE k = ?", 0), row(0, "123123.0"));
+            execute(cql, table, "INSERT INTO %s (k, floatval) VALUES (?, ?)", 0, 123123)
+            # Cassandra prints "123123.0", Scylla prints "123123". Since JSON
+            # does not have a distinction between integers and floating point,
+            # this difference is fine.
+            assert_rows(execute(cql, table, "SELECT k, toJson(floatval) FROM %s WHERE k = ?", 0), [0, EquivalentJson("123123.0")])
 
-        // ================ float ================
-        execute("INSERT INTO %s (k, floatval) VALUES (?, ?)", 0, 123.123f);
-        assertRows(execute("SELECT k, toJson(floatval) FROM %s WHERE k = ?", 0), row(0, "123.123"));
+            # ================ inet ================
+            execute(cql, table, "INSERT INTO %s (k, inetval) VALUES (?, ?)", 0, "127.0.0.1")
+            assert_rows(execute(cql, table, "SELECT k, toJson(inetval) FROM %s WHERE k = ?", 0), [0, "\"127.0.0.1\""])
 
-        execute("INSERT INTO %s (k, floatval) VALUES (?, ?)", 0, 123123f);
-        assertRows(execute("SELECT k, toJson(floatval) FROM %s WHERE k = ?", 0), row(0, "123123.0"));
+            execute(cql, table, "INSERT INTO %s (k, inetval) VALUES (?, ?)", 0, "::1")
+            # Cassandra prints ::1 as "0:0:0:0:0:0:0:1", Scylla as "::1", both
+            # are fine... We need to compare them using IP address equivalence
+            # test...
+            assert_rows(execute(cql, table, "SELECT k, toJson(inetval) FROM %s WHERE k = ?", 0), [0, EquivalentIp("\"0:0:0:0:0:0:0:1\"")])
 
-        // ================ inet ================
-        execute("INSERT INTO %s (k, inetval) VALUES (?, ?)", 0, InetAddress.getByName("127.0.0.1"));
-        assertRows(execute("SELECT k, toJson(inetval) FROM %s WHERE k = ?", 0), row(0, "\"127.0.0.1\""));
+            # ================ int ================
+            execute(cql, table, "INSERT INTO %s (k, intval) VALUES (?, ?)", 0, 123123)
+            assert_rows(execute(cql, table, "SELECT k, toJson(intval) FROM %s WHERE k = ?", 0), [0, "123123"])
 
-        execute("INSERT INTO %s (k, inetval) VALUES (?, ?)", 0, InetAddress.getByName("::1"));
-        assertRows(execute("SELECT k, toJson(inetval) FROM %s WHERE k = ?", 0), row(0, "\"0:0:0:0:0:0:0:1\""));
+            execute(cql, table, "INSERT INTO %s (k, intval) VALUES (?, ?)", 0, 0)
+            assert_rows(execute(cql, table, "SELECT k, toJson(intval) FROM %s WHERE k = ?", 0), [0, "0"])
 
-        // ================ int ================
-        execute("INSERT INTO %s (k, intval) VALUES (?, ?)", 0, 123123);
-        assertRows(execute("SELECT k, toJson(intval) FROM %s WHERE k = ?", 0), row(0, "123123"));
+            execute(cql, table, "INSERT INTO %s (k, intval) VALUES (?, ?)", 0, -123123)
+            assert_rows(execute(cql, table, "SELECT k, toJson(intval) FROM %s WHERE k = ?", 0), [0, "-123123"])
 
-        execute("INSERT INTO %s (k, intval) VALUES (?, ?)", 0, 0);
-        assertRows(execute("SELECT k, toJson(intval) FROM %s WHERE k = ?", 0), row(0, "0"));
+            # ================ smallint ================
+            execute(cql, table, "INSERT INTO %s (k, smallintval) VALUES (?, ?)", 0, 32767)
+            assert_rows(execute(cql, table, "SELECT k, toJson(smallintval) FROM %s WHERE k = ?", 0), [0, "32767"])
 
-        execute("INSERT INTO %s (k, intval) VALUES (?, ?)", 0, -123123);
-        assertRows(execute("SELECT k, toJson(intval) FROM %s WHERE k = ?", 0), row(0, "-123123"));
+            execute(cql, table, "INSERT INTO %s (k, smallintval) VALUES (?, ?)", 0, 0)
+            assert_rows(execute(cql, table, "SELECT k, toJson(smallintval) FROM %s WHERE k = ?", 0), [0, "0"])
 
-        // ================ smallint ================
-        execute("INSERT INTO %s (k, smallintval) VALUES (?, ?)", 0, (short) 32767);
-        assertRows(execute("SELECT k, toJson(smallintval) FROM %s WHERE k = ?", 0), row(0, "32767"));
+            execute(cql, table, "INSERT INTO %s (k, smallintval) VALUES (?, ?)", 0, -32768)
+            assert_rows(execute(cql, table, "SELECT k, toJson(smallintval) FROM %s WHERE k = ?", 0), [0, "-32768"])
 
-        execute("INSERT INTO %s (k, smallintval) VALUES (?, ?)", 0, (short) 0);
-        assertRows(execute("SELECT k, toJson(smallintval) FROM %s WHERE k = ?", 0), row(0, "0"));
+            # ================ tinyint ================
+            execute(cql, table, "INSERT INTO %s (k, tinyintval) VALUES (?, ?)", 0, 127)
+            assert_rows(execute(cql, table, "SELECT k, toJson(tinyintval) FROM %s WHERE k = ?", 0), [0, "127"])
 
-        execute("INSERT INTO %s (k, smallintval) VALUES (?, ?)", 0, (short) -32768);
-        assertRows(execute("SELECT k, toJson(smallintval) FROM %s WHERE k = ?", 0), row(0, "-32768"));
+            execute(cql, table, "INSERT INTO %s (k, tinyintval) VALUES (?, ?)", 0, 0)
+            assert_rows(execute(cql, table, "SELECT k, toJson(tinyintval) FROM %s WHERE k = ?", 0), [0, "0"])
 
-        // ================ tinyint ================
-        execute("INSERT INTO %s (k, tinyintval) VALUES (?, ?)", 0, (byte) 127);
-        assertRows(execute("SELECT k, toJson(tinyintval) FROM %s WHERE k = ?", 0), row(0, "127"));
+            execute(cql, table, "INSERT INTO %s (k, tinyintval) VALUES (?, ?)", 0, -128)
+            assert_rows(execute(cql, table, "SELECT k, toJson(tinyintval) FROM %s WHERE k = ?", 0), [0, "-128"])
 
-        execute("INSERT INTO %s (k, tinyintval) VALUES (?, ?)", 0, (byte) 0);
-        assertRows(execute("SELECT k, toJson(tinyintval) FROM %s WHERE k = ?", 0), row(0, "0"));
+            # ================ text (varchar) ================
+            execute(cql, table, "INSERT INTO %s (k, textval) VALUES (?, ?)", 0, "")
+            assert_rows(execute(cql, table, "SELECT k, toJson(textval) FROM %s WHERE k = ?", 0), [0, "\"\""])
 
-        execute("INSERT INTO %s (k, tinyintval) VALUES (?, ?)", 0, (byte) -128);
-        assertRows(execute("SELECT k, toJson(tinyintval) FROM %s WHERE k = ?", 0), row(0, "-128"));
+            execute(cql, table, "INSERT INTO %s (k, textval) VALUES (?, ?)", 0, "abcd")
+            assert_rows(execute(cql, table, "SELECT k, toJson(textval) FROM %s WHERE k = ?", 0), [0, "\"abcd\""])
 
-        // ================ text (varchar) ================
-        execute("INSERT INTO %s (k, textval) VALUES (?, ?)", 0, "");
-        assertRows(execute("SELECT k, toJson(textval) FROM %s WHERE k = ?", 0), row(0, "\"\""));
+            execute(cql, table, "INSERT INTO %s (k, textval) VALUES (?, ?)", 0, "\u8422")
+            assert_rows(execute(cql, table, "SELECT k, toJson(textval) FROM %s WHERE k = ?", 0), [0, "\"\u8422\""])
 
-        execute("INSERT INTO %s (k, textval) VALUES (?, ?)", 0, "abcd");
-        assertRows(execute("SELECT k, toJson(textval) FROM %s WHERE k = ?", 0), row(0, "\"abcd\""));
+            execute(cql, table, "INSERT INTO %s (k, textval) VALUES (?, ?)", 0, "\u0000")
+            assert_rows(execute(cql, table, "SELECT k, toJson(textval) FROM %s WHERE k = ?", 0), [0, "\"\\u0000\""])
 
-        execute("INSERT INTO %s (k, textval) VALUES (?, ?)", 0, "\u8422");
-        assertRows(execute("SELECT k, toJson(textval) FROM %s WHERE k = ?", 0), row(0, "\"\u8422\""));
+            # ================ time ================
+            # Reproduces #7988:
+            execute(cql, table, "INSERT INTO %s (k, timeval) VALUES (?, ?)", 0, 123)
+            assert_rows(execute(cql, table, "SELECT k, toJson(timeval) FROM %s WHERE k = ?", 0), [0, "\"00:00:00.000000123\""])
+            execute(cql, table, "INSERT INTO %s (k, timeval) VALUES (?, fromJson(?))", 0, "\"07:35:07.000111222\"")
+            assert_rows(execute(cql, table, "SELECT k, toJson(timeval) FROM %s WHERE k = ?", 0), [0, "\"07:35:07.000111222\""])
 
-        execute("INSERT INTO %s (k, textval) VALUES (?, ?)", 0, "\u0000");
-        assertRows(execute("SELECT k, toJson(textval) FROM %s WHERE k = ?", 0), row(0, "\"\\u0000\""));
+            # ================ timestamp ================
+            # Reproduces #7997:
+            execute(cql, table, "INSERT INTO %s (k, timestampval) VALUES (?, ?)", 0, datetime(2014, 1, 1, 0, 0, 0))
+            assert_rows(execute(cql, table, "SELECT k, toJson(timestampval) FROM %s WHERE k = ?", 0), [0, "\"2014-01-01 00:00:00.000Z\""])
 
-        // ================ time ================
-        execute("INSERT INTO %s (k, timeval) VALUES (?, ?)", 0, 123L);
-        assertRows(execute("SELECT k, toJson(timeval) FROM %s WHERE k = ?", 0), row(0, "\"00:00:00.000000123\""));
+            # ================ timeuuid ================
+            execute(cql, table, "INSERT INTO %s (k, timeuuidval) VALUES (?, ?)", 0, UUID("6bddc89a-5644-11e4-97fc-56847afe9799"))
+            assert_rows(execute(cql, table, "SELECT k, toJson(timeuuidval) FROM %s WHERE k = ?", 0), [0, "\"6bddc89a-5644-11e4-97fc-56847afe9799\""])
 
-        execute("INSERT INTO %s (k, timeval) VALUES (?, fromJson(?))", 0, "\"07:35:07.000111222\"");
-        assertRows(execute("SELECT k, toJson(timeval) FROM %s WHERE k = ?", 0), row(0, "\"07:35:07.000111222\""));
+            # ================ uuidval ================
+            execute(cql, table, "INSERT INTO %s (k, uuidval) VALUES (?, ?)", 0, UUID("6bddc89a-5644-11e4-97fc-56847afe9799"))
+            assert_rows(execute(cql, table, "SELECT k, toJson(uuidval) FROM %s WHERE k = ?", 0), [0, "\"6bddc89a-5644-11e4-97fc-56847afe9799\""])
 
-        // ================ timestamp ================
-        SimpleDateFormat sdf = new SimpleDateFormat("y-M-d");
-        sdf.setTimeZone(TimeZone.getTimeZone("UDT"));
-        execute("INSERT INTO %s (k, timestampval) VALUES (?, ?)", 0, sdf.parse("2014-01-01"));
-        assertRows(execute("SELECT k, toJson(timestampval) FROM %s WHERE k = ?", 0), row(0, "\"2014-01-01 00:00:00.000Z\""));
+            # ================ varint ================
+            execute(cql, table, "INSERT INTO %s (k, varintval) VALUES (?, ?)", 0, 123123123123123123123)
+            assert_rows(execute(cql, table, "SELECT k, toJson(varintval) FROM %s WHERE k = ?", 0), [0, "123123123123123123123"])
 
-        // ================ timeuuid ================
-        execute("INSERT INTO %s (k, timeuuidval) VALUES (?, ?)", 0, UUID.fromString("6bddc89a-5644-11e4-97fc-56847afe9799"));
-        assertRows(execute("SELECT k, toJson(timeuuidval) FROM %s WHERE k = ?", 0), row(0, "\"6bddc89a-5644-11e4-97fc-56847afe9799\""));
+            # ================ lists ================
+            execute(cql, table, "INSERT INTO %s (k, listval) VALUES (?, ?)", 0, [1, 2, 3])
+            assert_rows(execute(cql, table, "SELECT k, toJson(listval) FROM %s WHERE k = ?", 0), [0, "[1, 2, 3]"])
 
-         // ================ uuidval ================
-        execute("INSERT INTO %s (k, uuidval) VALUES (?, ?)", 0, UUID.fromString("6bddc89a-5644-11e4-97fc-56847afe9799"));
-        assertRows(execute("SELECT k, toJson(uuidval) FROM %s WHERE k = ?", 0), row(0, "\"6bddc89a-5644-11e4-97fc-56847afe9799\""));
+            execute(cql, table, "INSERT INTO %s (k, listval) VALUES (?, ?)", 0, [])
+            assert_rows(execute(cql, table, "SELECT k, toJson(listval) FROM %s WHERE k = ?", 0), [0, "null"])
 
-        // ================ varint ================
-        execute("INSERT INTO %s (k, varintval) VALUES (?, ?)", 0, new BigInteger("123123123123123123123"));
-        assertRows(execute("SELECT k, toJson(varintval) FROM %s WHERE k = ?", 0), row(0, "123123123123123123123"));
+            # frozen
+            execute(cql, table, "INSERT INTO %s (k, frozenlistval) VALUES (?, ?)", 0, [1, 2, 3])
+            assert_rows(execute(cql, table, "SELECT k, toJson(frozenlistval) FROM %s WHERE k = ?", 0), [0, "[1, 2, 3]"])
 
-        // ================ lists ================
-        execute("INSERT INTO %s (k, listval) VALUES (?, ?)", 0, list(1, 2, 3));
-        assertRows(execute("SELECT k, toJson(listval) FROM %s WHERE k = ?", 0), row(0, "[1, 2, 3]"));
+            # ================ sets ================
+            execute(cql, table, "INSERT INTO %s (k, setval) VALUES (?, ?)",
+                0, {UUID("6bddc89a-5644-11e4-97fc-56847afe9798"), UUID("6bddc89a-5644-11e4-97fc-56847afe9799")})
+            assert_rows(execute(cql, table, "SELECT k, toJson(setval) FROM %s WHERE k = ?", 0),
+                [0, "[\"6bddc89a-5644-11e4-97fc-56847afe9798\", \"6bddc89a-5644-11e4-97fc-56847afe9799\"]"])
 
-        execute("INSERT INTO %s (k, listval) VALUES (?, ?)", 0, list());
-        assertRows(execute("SELECT k, toJson(listval) FROM %s WHERE k = ?", 0), row(0, "null"));
+            execute(cql, table, "INSERT INTO %s (k, setval) VALUES (?, ?)", 0, {})
+            assert_rows(execute(cql, table, "SELECT k, toJson(setval) FROM %s WHERE k = ?", 0), [0, "null"])
 
-        // frozen
-        execute("INSERT INTO %s (k, frozenlistval) VALUES (?, ?)", 0, list(1, 2, 3));
-        assertRows(execute("SELECT k, toJson(frozenlistval) FROM %s WHERE k = ?", 0), row(0, "[1, 2, 3]"));
+            # frozen
+            execute(cql, table, "INSERT INTO %s (k, frozensetval) VALUES (?, ?)",
+                0, {UUID("6bddc89a-5644-11e4-97fc-56847afe9798"), UUID("6bddc89a-5644-11e4-97fc-56847afe9799")})
+            assert_rows(execute(cql, table, "SELECT k, toJson(frozensetval) FROM %s WHERE k = ?", 0),
+                [0, "[\"6bddc89a-5644-11e4-97fc-56847afe9798\", \"6bddc89a-5644-11e4-97fc-56847afe9799\"]"])
 
-        // ================ sets ================
-        execute("INSERT INTO %s (k, setval) VALUES (?, ?)",
-                0, set(UUID.fromString("6bddc89a-5644-11e4-97fc-56847afe9798"), (UUID.fromString("6bddc89a-5644-11e4-97fc-56847afe9799"))));
-        assertRows(execute("SELECT k, toJson(setval) FROM %s WHERE k = ?", 0),
-                row(0, "[\"6bddc89a-5644-11e4-97fc-56847afe9798\", \"6bddc89a-5644-11e4-97fc-56847afe9799\"]")
-        );
+            # ================ maps ================
+            execute(cql, table, "INSERT INTO %s (k, mapval) VALUES (?, ?)", 0, {"a": 1, "b": 2})
+            assert_rows(execute(cql, table, "SELECT k, toJson(mapval) FROM %s WHERE k = ?", 0), [0, "{\"a\": 1, \"b\": 2}"])
 
-        execute("INSERT INTO %s (k, setval) VALUES (?, ?)", 0, set());
-        assertRows(execute("SELECT k, toJson(setval) FROM %s WHERE k = ?", 0), row(0, "null"));
+            execute(cql, table, "INSERT INTO %s (k, mapval) VALUES (?, ?)", 0, {})
+            assert_rows(execute(cql, table, "SELECT k, toJson(mapval) FROM %s WHERE k = ?", 0), [0, "null"])
 
-        // frozen
-        execute("INSERT INTO %s (k, frozensetval) VALUES (?, ?)",
-                0, set(UUID.fromString("6bddc89a-5644-11e4-97fc-56847afe9798"), (UUID.fromString("6bddc89a-5644-11e4-97fc-56847afe9799"))));
-        assertRows(execute("SELECT k, toJson(frozensetval) FROM %s WHERE k = ?", 0),
-                row(0, "[\"6bddc89a-5644-11e4-97fc-56847afe9798\", \"6bddc89a-5644-11e4-97fc-56847afe9799\"]")
-        );
+            # frozen
+            execute(cql, table, "INSERT INTO %s (k, frozenmapval) VALUES (?, ?)", 0, {"a": 1, "b": 2})
+            assert_rows(execute(cql, table, "SELECT k, toJson(frozenmapval) FROM %s WHERE k = ?", 0), [0, "{\"a\": 1, \"b\": 2}"])
 
-        // ================ maps ================
-        execute("INSERT INTO %s (k, mapval) VALUES (?, ?)", 0, map("a", 1, "b", 2));
-        assertRows(execute("SELECT k, toJson(mapval) FROM %s WHERE k = ?", 0), row(0, "{\"a\": 1, \"b\": 2}"));
+            # ================ tuples ================
+            execute(cql, table, "INSERT INTO %s (k, tupleval) VALUES (?, ?)", 0, (1, "foobar", UUID("6bddc89a-5644-11e4-97fc-56847afe9799")))
+            assert_rows(execute(cql, table, "SELECT k, toJson(tupleval) FROM %s WHERE k = ?", 0),
+                [0, "[1, \"foobar\", \"6bddc89a-5644-11e4-97fc-56847afe9799\"]"])
 
-        execute("INSERT INTO %s (k, mapval) VALUES (?, ?)", 0, map());
-        assertRows(execute("SELECT k, toJson(mapval) FROM %s WHERE k = ?", 0), row(0, "null"));
+            execute(cql, table, "INSERT INTO %s (k, tupleval) VALUES (?, ?)", 0, (1, "foobar", None))
+            assert_rows(execute(cql, table, "SELECT k, toJson(tupleval) FROM %s WHERE k = ?", 0),
+                [0, "[1, \"foobar\", null]"])
 
-        // frozen
-        execute("INSERT INTO %s (k, frozenmapval) VALUES (?, ?)", 0, map("a", 1, "b", 2));
-        assertRows(execute("SELECT k, toJson(frozenmapval) FROM %s WHERE k = ?", 0), row(0, "{\"a\": 1, \"b\": 2}"));
+            # ================ UDTs ================
+            execute(cql, table, "INSERT INTO %s (k, udtval) VALUES (?, {a: ?, b: ?, c: ?})", 0, 1, UUID("6bddc89a-5644-11e4-97fc-56847afe9799"), {"foo", "bar"})
+            assert_rows(execute(cql, table, "SELECT k, toJson(udtval) FROM %s WHERE k = ?", 0),
+                [0, "{\"a\": 1, \"b\": \"6bddc89a-5644-11e4-97fc-56847afe9799\", \"c\": [\"bar\", \"foo\"]}"])
 
-        // ================ tuples ================
-        execute("INSERT INTO %s (k, tupleval) VALUES (?, ?)", 0, tuple(1, "foobar", UUID.fromString("6bddc89a-5644-11e4-97fc-56847afe9799")));
-        assertRows(execute("SELECT k, toJson(tupleval) FROM %s WHERE k = ?", 0),
-            row(0, "[1, \"foobar\", \"6bddc89a-5644-11e4-97fc-56847afe9799\"]")
-        );
+            execute(cql, table, "INSERT INTO %s (k, udtval) VALUES (?, {a: ?, b: ?})", 0, 1, UUID("6bddc89a-5644-11e4-97fc-56847afe9799"))
+            assert_rows(execute(cql, table, "SELECT k, toJson(udtval) FROM %s WHERE k = ?", 0),
+                [0, "{\"a\": 1, \"b\": \"6bddc89a-5644-11e4-97fc-56847afe9799\", \"c\": null}"])
 
-        execute("INSERT INTO %s (k, tupleval) VALUES (?, ?)", 0, tuple(1, "foobar", null));
-        assertRows(execute("SELECT k, toJson(tupleval) FROM %s WHERE k = ?", 0),
-                row(0, "[1, \"foobar\", null]")
-        );
+            # ================ duration ================
+            # Reproduces #8001:
+            execute(cql, table, "INSERT INTO %s (k, durationval) VALUES (?, 12µs)", 0)
+            assert_rows(execute(cql, table, "SELECT k, toJson(durationval) FROM %s WHERE k = ?", 0), [0, "\"12us\""])
 
-        // ================ UDTs ================
-        execute("INSERT INTO %s (k, udtval) VALUES (?, {a: ?, b: ?, c: ?})", 0, 1, UUID.fromString("6bddc89a-5644-11e4-97fc-56847afe9799"), set("foo", "bar"));
-        assertRows(execute("SELECT k, toJson(udtval) FROM %s WHERE k = ?", 0),
-                row(0, "{\"a\": 1, \"b\": \"6bddc89a-5644-11e4-97fc-56847afe9799\", \"c\": [\"bar\", \"foo\"]}")
-        );
+            execute(cql, table, "INSERT INTO %s (k, durationval) VALUES (?, P1Y1M2DT10H5M)", 0)
+            assert_rows(execute(cql, table, "SELECT k, toJson(durationval) FROM %s WHERE k = ?", 0), [0, "\"1y1mo2d10h5m\""])
 
-        execute("INSERT INTO %s (k, udtval) VALUES (?, {a: ?, b: ?})", 0, 1, UUID.fromString("6bddc89a-5644-11e4-97fc-56847afe9799"));
-        assertRows(execute("SELECT k, toJson(udtval) FROM %s WHERE k = ?", 0),
-                row(0, "{\"a\": 1, \"b\": \"6bddc89a-5644-11e4-97fc-56847afe9799\", \"c\": null}")
-        );
-
-        // ================ duration ================
-        execute("INSERT INTO %s (k, durationval) VALUES (?, 12µs)", 0);
-        assertRows(execute("SELECT k, toJson(durationval) FROM %s WHERE k = ?", 0), row(0, "\"12us\""));
-
-        execute("INSERT INTO %s (k, durationval) VALUES (?, P1Y1M2DT10H5M)", 0);
-        assertRows(execute("SELECT k, toJson(durationval) FROM %s WHERE k = ?", 0), row(0, "\"1y1mo2d10h5m\""));
-    }
-
+"""
     @Test
     public void testJsonWithGroupBy() throws Throwable
     {
