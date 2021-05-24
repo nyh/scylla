@@ -182,7 +182,18 @@ protected:
         handle_CORS(*req, *rep, false);
         rep->set_status(reply::status_type::ok);
         rep->write_body("txt", format("healthy: {}", req->get_header("Host")));
+#if 1
         return make_ready_future<std::unique_ptr<reply>>(std::move(rep));
+#else
+        // Although we don't care about the request body, and we expect it
+        // to be empty, we want to read it to avoid the connection breaking
+        // as described in issue #8691, and to circumvent known Seastar bugs.
+        assert(req->content_stream);
+        return httpd::skip_entire_stream(*req->content_stream).then(
+            [rep = std::move(rep)] () mutable {
+                return std::move(rep);
+            });
+#endif
     }
 };
 
@@ -212,7 +223,19 @@ protected:
         rep->set_status(reply::status_type::ok);
         rep->set_content_type("json");
         rep->_content = rjson::print(results);
+#if 1
         return make_ready_future<std::unique_ptr<reply>>(std::move(rep));
+#else
+        // Although we don't care about the request body, and we expect it
+        // to be empty, we want to read it to avoid the connection breaking
+        // as described in issue #8691, and to circumvent known Seastar bugs.
+        assert(req->content_stream);
+        return httpd::skip_entire_stream(*req->content_stream).then(
+            [rep = std::move(rep)] () mutable {
+                return std::move(rep);
+            });
+#endif
+
     }
 };
 
@@ -228,7 +251,18 @@ protected:
         handle_CORS(*req, *rep, true);
         rep->set_status(reply::status_type::ok);
         rep->write_body("txt", sstring(""));
+#if 1
         return make_ready_future<std::unique_ptr<reply>>(std::move(rep));
+#else
+        // Although we don't care about the request body, and we expect it
+        // to be empty, we want to read it to avoid the connection breaking
+        // as described in issue #8691, and to circumvent known Seastar bugs.
+        assert(req->content_stream);
+        return httpd::skip_entire_stream(*req->content_stream).then(
+            [rep = std::move(rep)] () mutable {
+                return std::move(rep);
+            });
+#endif
     }
 };
 
