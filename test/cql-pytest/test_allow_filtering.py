@@ -201,6 +201,15 @@ def test_allow_filtering_indexed_filtering_required(cql, table2):
 def test_allow_filtering_indexed_a_and_k(cql, table2):
     check_af_optional(cql, table2, 'a=20 AND k=1', lambda row: row.a==20 and row.k==1)
 
+# While searching for a=? for any non-null value can use the index, searching
+# for a null value cannot use the index because we don't have a null entry
+# in the index... However the result of equality check to null is always false
+# (see test_null.py for more tests on that) so a=null returns absolutely
+# nothing so we don't need any data to answer this query - and in particular
+# don't need ALLOW FILTERING.
+def test_allow_filtering_indexed_null_eq(cql, table2):
+    check_af_optional(cql, table2, 'a=20', lambda row: row.a==20)
+    check_af_optional(cql, table2, 'a=null', lambda row: False)
 
 # table3 is an even more elaborate table with several partition key columns,
 # clustering key columns, and indexed columns of different types, to allow
