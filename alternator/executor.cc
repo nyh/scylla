@@ -3876,6 +3876,77 @@ future<executor::request_return_type> executor::list_tables(client_state& client
     return make_ready_future<executor::request_return_type>(make_jsonable(std::move(response)));
 }
 
+// TODO: consider moving most TTL stuff (except perhaps command parsing?)
+// to ttl.cc.
+static const sstring TTL_TAG_KEY("system:ttl_attribute");
+
+future<executor::request_return_type> executor::update_time_to_live(client_state& client_state, service_permit permit, rjson::value request) {
+    _stats.api_operations.update_time_to_live++;
+    schema_ptr schema = get_table(_proxy, request);
+    rjson::value* spec = rjson::find(request, "TimeToLiveSpecification");
+    if (!spec || !spec->IsObject()) {
+        co_return api_error::validation("UpdateTimeToLive missing mandatory TimeToLiveSpecification");
+    }
+    const rjson::value* v = rjson::find(*spec, "Enabled");
+    if (!v || !v->IsBool()) {
+        co_return api_error::validation("UpdateTimeToLive requires boolean Enabled");
+    }
+    bool enabled = v->GetBool();
+    v = rjson::find(*spec, "AttributeName");
+    if (!v || !v->IsString()) {
+        co_return api_error::validation("UpdateTimeToLive requires string AttributeName");
+    }
+    // Although the DynamoDB documentation specifies that attribute names
+    // should be between 1 and 64K bytes, in practice, it only allows
+    // between 1 and 255 bytes. There are no other limitations on which
+    // characters are allowed in the name.
+    if (v->GetStringLength() < 1 || v->GetStringLength() > 255) {
+        co_return api_error::validation("The length of AttributeName must be between 1 and 255");
+    }
+    sstring attribute_name(v->GetString(), v->GetStringLength());
+
+    std::map<sstring, sstring> tags_map = get_tags_of_table(schema);
+    if (enabled) {
+        if (tags_map.contains(TTL_TAG_KEY)) {
+            co_return api_error::validation("TTL is already enabled");
+        }
+        tags_map[TTL_TAG_KEY] = attribute_name;
+    } else {
+        auto i = tags_map.find(TTL_TAG_KEY);
+        if (i == tags_map.end()) {
+            co_return api_error::validation("TTL is already disabled");
+        } else if (i->second != attribute_name) {
+            co_return api_error::validation(format(
+                "Requested to disable TTL on attribute {}, but a different attribute {} is enabled.",
+                attribute_name, i->second));
+        }
+        tags_map.erase(TTL_TAG_KEY);
+    }
+    co_await update_tags(_mm, schema, std::move(tags_map));
+    // Prepare the response, which contains a TimeToLiveSpecification
+    // basically identical to the request's
+    rjson::value response = rjson::empty_object();
+    rjson::set(response, "TimeToLiveSpecification", std::move(*spec));
+    co_return make_jsonable(std::move(response));
+}
+
+future<executor::request_return_type> executor::describe_time_to_live(client_state& client_state, service_permit permit, rjson::value request) {
+    _stats.api_operations.update_time_to_live++;
+    schema_ptr schema = get_table(_proxy, request);
+    std::map<sstring, sstring> tags_map = get_tags_of_table(schema);
+    rjson::value desc = rjson::empty_object();
+    auto i = tags_map.find(TTL_TAG_KEY);
+    if (i == tags_map.end()) {
+        rjson::set(desc, "TimeToLiveStatus", "DISABLED");
+    } else {
+        rjson::set(desc, "TimeToLiveStatus", "ENABLED");
+        rjson::set(desc, "AttributeName", rjson::from_string(i->second));
+    }
+    rjson::value response = rjson::empty_object();
+    rjson::set(response, "TimeToLiveDescription", std::move(desc));
+    co_return make_jsonable(std::move(response));
+}
+
 future<executor::request_return_type> executor::describe_endpoints(client_state& client_state, service_permit permit, rjson::value request, std::string host_header) {
     _stats.api_operations.describe_endpoints++;
     rjson::value response = rjson::empty_object();
