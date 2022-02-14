@@ -50,6 +50,7 @@
 #include "gms/gossiper.hh"
 #include "schema_registry.hh"
 #include "utils/error_injection.hh"
+#include "db/schema_tables.hh"
 
 logging::logger elogger("alternator-executor");
 
@@ -861,6 +862,12 @@ static void verify_billing_mode(const rjson::value& request) {
 static future<executor::request_return_type> create_table_on_shard0(tracing::trace_state_ptr trace_state, rjson::value request, service::storage_proxy& sp, service::migration_manager& mm, gms::gossiper& gossiper) {
     assert(this_shard_id() == 0);
 
+    // We begin by parsing and validating the content of the CreateTable
+    // command. We can't inspect the current database schema at this point
+    // (e.g., verify that this table doesn't already exist) - we can only
+    // do this before after taking group0_guard.
+    // FIXME: there is no reason to do this part (until group0_guard) on
+    // shard 0.
     std::string table_name = get_table_name(request);
     if (table_name.find(executor::INTERNAL_TABLE_PREFIX) == 0) {
         co_return api_error::validation(format("Prefix {} is reserved for accessing internal tables", executor::INTERNAL_TABLE_PREFIX));
@@ -1020,8 +1027,14 @@ static future<executor::request_return_type> create_table_on_shard0(tracing::tra
         update_tags_map(*tags, tags_map, update_tags_action::add_tags);
     }
 
-    builder.add_extension(tags_extension::NAME, ::make_shared<tags_extension>());
+    if (tags_map.empty()){
+        builder.add_extension(tags_extension::NAME, ::make_shared<tags_extension>());
+    } else {
+        builder.add_extension(tags_extension::NAME, ::make_shared<tags_extension>(tags_map));
+    }
+
     schema_ptr schema = builder.build();
+
     auto where_clause_it = where_clauses.begin();
     for (auto& view_builder : view_builders) {
         // Note below we don't need to add virtual columns, as all
@@ -1038,55 +1051,40 @@ static future<executor::request_return_type> create_table_on_shard0(tracing::tra
         ++where_clause_it;
     }
 
+    // FIXME: the following needs to be in a loop. If mm.announce() below
+    // fails, we need to retry the whole thing.
+    auto group0_guard = co_await mm.start_group0_operation();
+    auto ts = group0_guard.write_timestamp();
+    std::vector<mutation> schema_mutations;
     try {
-        auto group0_guard_ks = co_await mm.start_group0_operation();
-        auto ts = group0_guard_ks.write_timestamp();
-        co_await mm.announce(co_await create_keyspace(keyspace_name, mm, gossiper, ts), std::move(group0_guard_ks));
+        schema_mutations = co_await create_keyspace(keyspace_name, mm, gossiper, ts);
     } catch (exceptions::already_exists_exception&) {
-        // Ignore the fact that the keyspace may already exist. See discussion in #6340
+        if (sp.data_dictionary().has_schema(keyspace_name, table_name)) {
+            co_return api_error::resource_in_use(format("Table {} already exists", table_name));
+        }
     }
-
-    try {
-        // The code should be rewritten in a way that allows creating mutations
-        // for all the changes in a single mutation array before announcing.
-        // See https://github.com/scylladb/scylla/issues/9868
-        {
-            auto group0_guard_cf = co_await mm.start_group0_operation();
-            auto ts = group0_guard_cf.write_timestamp();
-            co_await mm.announce(co_await mm.prepare_new_column_family_announcement(schema, ts), std::move(group0_guard_cf));
-        }
-
-        {
-            std::vector<mutation> m;
-            auto group0_guard_views = co_await mm.start_group0_operation();
-            auto ts = group0_guard_views.write_timestamp();
-            co_await parallel_for_each(std::move(view_builders), [&mm, schema, &m, ts] (schema_builder builder) -> future<> {
-                auto vm = co_await mm.prepare_new_view_announcement(view_ptr(builder.build()), ts);
-                std::move(vm.begin(), vm.end(), std::back_inserter(m));
-            });
-
-            co_await mm.announce(std::move(m), std::move(group0_guard_views));
-        }
-
-        if (!tags_map.empty()) {
-            auto group0_guard_tags = co_await mm.start_group0_operation();
-            auto ts = group0_guard_tags.write_timestamp();
-
-            schema_builder builder(schema);
-            builder.add_extension(tags_extension::NAME, ::make_shared<tags_extension>(tags_map));
-
-            co_await mm.announce(co_await mm.prepare_column_family_update_announcement(builder.build(), false, std::vector<view_ptr>(), ts), std::move(group0_guard_tags));
-        }
-
-        co_await wait_for_schema_agreement(mm, db::timeout_clock::now() + 10s);
-
-        rjson::value status = rjson::empty_object();
-        executor::supplement_table_info(request, *schema, sp);
-        rjson::add(status, "TableDescription", std::move(request));
-        co_return make_jsonable(std::move(status));
-    } catch(exceptions::already_exists_exception&) {
-        co_return api_error::resource_in_use(format("Table {} already exists", table_name));
+    if (sp.data_dictionary().try_find_table(schema->id())) {
+        // This should never happen, the ID is supposed to be unique
+        co_return api_error::internal(format("Table with ID {} already exists", schema->id()));
     }
+    db::schema_tables::add_table_or_view_to_schema_mutation(schema, ts, true, schema_mutations);
+    // NYH FIXME: what mutations does before_create_column_family actually
+    // accept? Why is it needed at all?
+    mm.get_notifier().before_create_column_family(*schema, schema_mutations, ts);
+    for (schema_builder& view_builder : view_builders) {
+        // NYH NOTE: we can't use db::schema_tables::make_create_view_mutations
+        // because it wants to inspect the base (and re-add it) while we
+        // already added it here.
+        db::schema_tables::add_table_or_view_to_schema_mutation(
+            view_ptr(view_builder.build()), ts, true, schema_mutations);
+    }
+    co_await mm.announce(std::move(schema_mutations), std::move(group0_guard));
+
+    co_await wait_for_schema_agreement(mm, db::timeout_clock::now() + 10s);
+    rjson::value status = rjson::empty_object();
+    executor::supplement_table_info(request, *schema, sp);
+    rjson::add(status, "TableDescription", std::move(request));
+    co_return make_jsonable(std::move(status));
 }
 
 future<executor::request_return_type> executor::create_table(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request) {

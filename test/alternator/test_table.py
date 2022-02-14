@@ -450,6 +450,10 @@ def test_concurrent_create_and_delete_table(dynamodb, table_def):
                 client.delete_table(TableName=table_name)
                 break
             except ClientError as e:
+                if 'ResourceNotFoundException' in str(e):
+                    # The table was already deleted by the deletion thread,
+                    # nothing left to do :-)
+                    break
                 if 'ResourceInUseException' in str(e):
                     # A CreateTable opereration is still in progress,
                     # we can't delete the table yet.
