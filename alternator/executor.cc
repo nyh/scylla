@@ -913,7 +913,6 @@ static future<executor::request_return_type> create_table_on_shard0(tracing::tra
     // any table.
     const rjson::value* gsi = rjson::find(request, "GlobalSecondaryIndexes");
     std::vector<schema_builder> view_builders;
-    std::vector<sstring> where_clauses;
     std::unordered_set<std::string> index_names;
     if (gsi) {
         if (!gsi->IsArray()) {
@@ -963,12 +962,6 @@ static future<executor::request_return_type> create_table_on_shard0(tracing::tra
             if  (!range_key.empty() && range_key != view_hash_key && range_key != view_range_key) {
                 add_column(view_builder, range_key, attribute_definitions, column_kind::clustering_key);
             }
-            sstring where_clause = format("{} IS NOT NULL", cql3::util::maybe_quote(view_hash_key));
-            if (!view_range_key.empty()) {
-                where_clause = format("{} AND {} IS NOT NULL", where_clause,
-                    cql3::util::maybe_quote(view_range_key));
-            }
-            where_clauses.push_back(std::move(where_clause));
             view_builders.emplace_back(std::move(view_builder));
         }
     }
@@ -1021,12 +1014,6 @@ static future<executor::request_return_type> create_table_on_shard0(tracing::tra
             // Note above we don't need to add virtual columns, as all
             // base columns were copied to view. TODO: reconsider the need
             // for virtual columns when we support Projection.
-            sstring where_clause = format("{} IS NOT NULL", cql3::util::maybe_quote(view_hash_key));
-            if (!view_range_key.empty()) {
-                where_clause = format("{} AND {} IS NOT NULL", where_clause,
-                    cql3::util::maybe_quote(view_range_key));
-            }
-            where_clauses.push_back(std::move(where_clause));
             view_builders.emplace_back(std::move(view_builder));
         }
     }
@@ -1061,7 +1048,6 @@ static future<executor::request_return_type> create_table_on_shard0(tracing::tra
     builder.add_extension(db::tags_extension::NAME, ::make_shared<db::tags_extension>(tags_map));
 
     schema_ptr schema = builder.build();
-    auto where_clause_it = where_clauses.begin();
     for (auto& view_builder : view_builders) {
         // Note below we don't need to add virtual columns, as all
         // base columns were copied to view. TODO: reconsider the need
@@ -1072,9 +1058,8 @@ static future<executor::request_return_type> create_table_on_shard0(tracing::tra
             }
         }
         const bool include_all_columns = true;
-        view_builder.with_view_info(*schema, include_all_columns, *where_clause_it);
+        view_builder.with_view_info(*schema, include_all_columns, "");
         view_builder.add_extension(db::tags_extension::NAME, ::make_shared<db::tags_extension>());
-        ++where_clause_it;
     }
 
     // FIXME: the following needs to be in a loop. If mm.announce() below
