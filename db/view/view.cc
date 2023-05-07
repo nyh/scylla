@@ -627,7 +627,7 @@ private:
             if (auto* collection_computation = dynamic_cast<const collection_column_computation*>(&computation)) {
                 return handle_collection_column_computation(collection_computation);
             }
-            computed_value = computation.compute_value(_base, _base_key);
+            computed_value = computation.compute_value(_base, _base_key, _update, _existing);
         }
 
         return {managed_bytes_view(linearized_values.emplace_back(std::move(computed_value)))};

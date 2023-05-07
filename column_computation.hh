@@ -42,7 +42,19 @@ public:
     virtual column_computation_ptr clone() const = 0;
 
     virtual bytes serialize() const = 0;
-    virtual bytes compute_value(const schema& schema, const partition_key& key) const = 0;
+    virtual bytes compute_value(const schema& schema, const partition_key& key,
+        const db::view::clustering_or_static_row& update,
+        const std::optional<db::view::clustering_or_static_row>& existing) const = 0;
+    // An alternative compute_value() without knowing anything about the row
+    // except the partition key. Only call this function if you're sure that
+    // the specific computation subclass wouldn't need or care about the row.
+    // Only specific computations (namely *_token_column_computation)
+    // reimplement this method - others will use the default implementation
+    // and throw.
+    virtual bytes compute_value(const schema& schema, const partition_key& key) const {
+        throw std::logic_error("column_computation::compute_value() called without row");
+    }
+
     /*
      * depends_on_non_primary_key_column for a column computation is needed to
      * detect a case where the primary key of a materialized view depends on a
@@ -73,6 +85,9 @@ public:
     }
     virtual bytes serialize() const override;
     virtual bytes compute_value(const schema& schema, const partition_key& key) const override;
+    virtual bytes compute_value(const schema& schema, const partition_key& key,
+        const db::view::clustering_or_static_row& update,
+        const std::optional<db::view::clustering_or_static_row>& existing) const override;
 };
 
 
@@ -94,6 +109,9 @@ public:
     }
     virtual bytes serialize() const override;
     virtual bytes compute_value(const schema& schema, const partition_key& key) const override;
+    virtual bytes compute_value(const schema& schema, const partition_key& key,
+        const db::view::clustering_or_static_row& update,
+        const std::optional<db::view::clustering_or_static_row>& existing) const override;
 };
 
 /*
@@ -133,7 +151,9 @@ public:
     static column_computation_ptr for_target_type(std::string_view type, const bytes& collection_name);
 
     virtual bytes serialize() const override;
-    virtual bytes compute_value(const schema& schema, const partition_key& key) const override;
+    virtual bytes compute_value(const schema& schema, const partition_key& key,
+        const db::view::clustering_or_static_row& update,
+        const std::optional<db::view::clustering_or_static_row>& existing) const override;
     virtual column_computation_ptr clone() const override {
         return std::make_unique<collection_column_computation>(*this);
     }
