@@ -33,6 +33,7 @@
 #include "db/tags/utils.hh"
 #include "db/tags/extension.hh"
 #include "index/target_parser.hh"
+#include "alternator/extract_from_attrs.hh"
 
 constexpr int32_t schema::NAME_LENGTH;
 
@@ -1879,6 +1880,9 @@ column_computation_ptr column_computation::deserialize(bytes_view raw) {
                 return collection->clone();
             }
         }
+    }
+    if (type == alternator::extract_from_attrs_column_computation::TYPE_NAME) {
+        return std::make_unique<alternator::extract_from_attrs_column_computation>(parsed);
     }
     throw std::runtime_error(format("Incorrect column computation type {} found when parsing {}", *type_json, parsed));
 }
