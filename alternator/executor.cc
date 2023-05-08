@@ -587,7 +587,7 @@ future<executor::request_return_type> executor::delete_table(client_state& clien
     co_return make_jsonable(std::move(response));
 }
 
-static data_type parse_key_type(const std::string& type) {
+static data_type parse_key_type(std::string_view type) {
     // Note that keys are only allowed to be string, blob or number (S/B/N).
     // The other types: boolean and various lists or sets - are not allowed.
     if (type.length() == 1) {
@@ -602,7 +602,7 @@ static data_type parse_key_type(const std::string& type) {
 }
 
 
-static void add_column(schema_builder& builder, const std::string& name, const rjson::value& attribute_definitions, column_kind kind) {
+static void add_column(schema_builder& builder, const std::string& name, const rjson::value& attribute_definitions, column_kind kind, bool computed_column=false) {
     // FIXME: Currently, the column name ATTRS_COLUMN_NAME is not allowed
     // because we use it for our untyped attribute map, and we can't have a
     // second column with the same name. We should fix this, by renaming
@@ -614,7 +614,16 @@ static void add_column(schema_builder& builder, const std::string& name, const r
         const rjson::value& attribute_info = *it;
         if (attribute_info["AttributeName"].GetString() == name) {
             auto type = attribute_info["AttributeType"].GetString();
-            builder.with_column(to_bytes(name), parse_key_type(type), kind);
+            data_type dt = parse_key_type(type);
+            if (computed_column) {
+                // Computed column for GSI (doesn't choose a real column as-is
+                // but rather extracts a single value from the ":attrs" map)
+                alternator_type at = type_info_from_string(type).atype;
+                builder.with_computed_column(to_bytes(name), dt, kind,
+                    std::make_unique<extract_from_attrs_column_computation>(name, at));
+            } else {
+                builder.with_column(to_bytes(name), dt, kind);
+            }
             return;
         }
     }
@@ -1029,6 +1038,8 @@ static future<executor::request_return_type> create_table_on_shard0(tracing::tra
             // require the MV code to copy just parts of the attrs map.
             schema_builder view_builder(keyspace_name, vname);
             auto [view_hash_key, view_range_key] = parse_key_schema(g);
+#undef OLDGSI
+#ifdef OLDGSI
             if (partial_schema->get_column_definition(to_bytes(view_hash_key)) == nullptr) {
                 // A column that exists in a global secondary index is upgraded from being a map entry
                 // to having a regular column definition in the base schema
@@ -1048,6 +1059,28 @@ static future<executor::request_return_type> create_table_on_shard0(tracing::tra
                 }
                 add_column(view_builder, view_range_key, attribute_definitions, column_kind::clustering_key);
             }
+#else
+            // If an attribute is already a real column in the base table
+            // (i.e., a key attribute), we can use it directly as a view key.
+            // Otherwise, we need to add it as a "computed column", which
+            // extracts and deserializes the attribute from the ":attrs" map.
+            if (partial_schema->get_column_definition(to_bytes(view_hash_key))) {
+                add_column(view_builder, view_hash_key, attribute_definitions, column_kind::partition_key);
+            } else {
+                add_column(view_builder, view_hash_key, attribute_definitions, column_kind::partition_key, true);
+            }
+            if (!view_range_key.empty()) {
+                if (partial_schema->get_column_definition(to_bytes(view_range_key))) {
+                    add_column(view_builder, view_range_key, attribute_definitions, column_kind::clustering_key);
+                } else {
+                    if (!partial_schema->get_column_definition(to_bytes(view_hash_key))) {
+                        // FIXME: This warning should go away. See issue #6714
+                        elogger.warn("Only 1 regular column from the base table should be used in the GSI key in order to ensure correct liveness management without assumptions");
+                    }
+                    add_column(view_builder, view_range_key, attribute_definitions, column_kind::clustering_key, true);
+                }
+            }
+#endif
             // Base key columns which aren't part of the index's key need to
             // be added to the view nontheless, as (additional) clustering
             // key(s).
@@ -1369,7 +1402,7 @@ public:
     struct delete_item {};
     struct put_item {};
     put_or_delete_item(const rjson::value& key, schema_ptr schema, delete_item);
-    put_or_delete_item(const rjson::value& item, schema_ptr schema, put_item);
+    put_or_delete_item(const rjson::value& item, schema_ptr schema, put_item, std::unordered_map<bytes, std::string> key_attributes);
     // put_or_delete_item doesn't keep a reference to schema (so it can be
     // moved between shards for LWT) so it needs to be given again to build():
     mutation build(schema_ptr schema, api::timestamp_type ts) const;
@@ -1398,7 +1431,75 @@ static inline const column_definition* find_attribute(const schema& schema, cons
     return cdef;
 }
 
-put_or_delete_item::put_or_delete_item(const rjson::value& item, schema_ptr schema, put_item)
+
+// Get a list of all attributes that serve as a key attributes for any of the
+// GSIs or LSIs of this table, and the declared type for each (can be only
+// "S", "B", or "N"). The implementation below will also list the base table's
+// key columns (they are the views' clustering keys).
+std::unordered_map<bytes, std::string> si_key_attributes(data_dictionary::table t) {
+    std::unordered_map<bytes, std::string> ret;
+    for (const view_ptr& v : t.views()) {
+        for (const column_definition& cdef : v->partition_key_columns()) {
+            ret[cdef.name()] = type_to_string(cdef.type);
+        }
+        for (const column_definition& cdef : v->clustering_key_columns()) {
+            ret[cdef.name()] = type_to_string(cdef.type);
+        }
+    }
+    return ret;
+}
+
+// When an attribute is a key (hash or sort) of one of the GSIs on a table,
+// DynamoDB refuses an update to that attribute with a an unsuitable value.
+// Unsuitable values are:
+//   1. An empty string (those are normally allowed as values, but not allowed
+//      as keys, including GSI keys).
+//   2. A value with a type different than that declared for the GSI key.
+//      Normally non-key attributes can take values of any type (DynamoDB is
+//      schema-less), but as soon as an attribute is used as a GSI key, it
+//      must be set only to the specific type declared for that key.
+//   (Note that a missing value for an GSI key attribute is fine  - the update
+//   will happen on the base table, but won't reach the view table). In this
+//   case, this function simply won't be called for this attribute.
+//
+// This function checks if the given attribute update is an update to some
+// GSI's key, and if the value is unsuitable, a api_error::validation is
+// thrown. The checking here is similar to the checking done in
+// get_key_from_typed_value() for the base table's key columns.
+//
+// validate_value_if_gsi_key() should only be called after validate_value()
+// already validated that the value itself has a valid form.
+static inline void validate_value_if_gsi_key(
+        std::unordered_map<bytes, std::string> key_attributes,
+        const bytes& attribute,
+        const rjson::value& value) {
+    if (key_attributes.empty()) {
+        return;
+    }
+    auto it = key_attributes.find(attribute);
+    if (it == key_attributes.end()) {
+        // Given attribute is not a key column with a fixed type, so no
+        // more validation to do.
+        return;
+    }
+    const std::string& expected_type = it->second;
+    // We assume that validate_value() was previously called on this value,
+    // so value is known to be of the proper format (an object with one
+    // member, whose key and value are strings)
+    std::string_view value_type = rjson::to_string_view(value.MemberBegin()->name);
+    if (expected_type != value_type) {
+        throw api_error::validation(format(
+            "Type mismatch: expected type {} for GSI key attribute {}, got type {}",
+            expected_type, attribute, value_type));
+    }
+    std::string_view value_content = rjson::to_string_view(value.MemberBegin()->value);
+    if (value_content.empty()) {
+        throw api_error::validation(format(
+            "GSI key attribute {} cannot be set to an empty string", attribute));
+    }
+}
+
+put_or_delete_item::put_or_delete_item(const rjson::value& item, schema_ptr schema, put_item, std::unordered_map<bytes, std::string> key_attributes)
         : _pk(pk_from_json(item, schema)), _ck(ck_from_json(item, schema)) {
     _cells = std::vector<cell>();
     _cells->reserve(item.MemberCount());
@@ -1407,10 +1508,12 @@ put_or_delete_item::put_or_delete_item(const rjson::value& item, schema_ptr sche
         validate_value(it->value, "PutItem");
         const column_definition* cdef = find_attribute(*schema, column_name);
         if (!cdef) {
-            bytes value = serialize_item(it->value);
+            // This attribute may be a key column of one of the GSI, in which
+            // case there are some limitations on the value
+            validate_value_if_gsi_key(key_attributes, column_name, it->value);
             _cells->push_back({std::move(column_name), serialize_item(it->value)});
         } else if (!cdef->is_primary_key()) {
-            // Fixed-type regular column can be used for GSI key
+            // Fixed-type regular column can be used for LSI key
             _cells->push_back({std::move(column_name),
                     get_key_from_typed_value(it->value, *cdef)});
         }
@@ -1727,7 +1830,8 @@ public:
     parsed::condition_expression _condition_expression;
     put_item_operation(service::storage_proxy& proxy, rjson::value&& request)
         : rmw_operation(proxy, std::move(request))
-        , _mutation_builder(rjson::get(_request, "Item"), schema(), put_or_delete_item::put_item{}) {
+        , _mutation_builder(rjson::get(_request, "Item"), schema(), put_or_delete_item::put_item{},
+            si_key_attributes(proxy.data_dictionary().find_table(schema()->ks_name(), schema()->cf_name()))) {
         _pk = _mutation_builder.pk();
         _ck = _mutation_builder.ck();
         if (_returnvalues != returnvalues::NONE && _returnvalues != returnvalues::ALL_OLD) {
@@ -2069,7 +2173,8 @@ future<executor::request_return_type> executor::batch_write_item(client_state& c
                 const rjson::value& put_request = r->value;
                 const rjson::value& item = put_request["Item"];
                 mutation_builders.emplace_back(schema, put_or_delete_item(
-                        item, schema, put_or_delete_item::put_item{}));
+                        item, schema, put_or_delete_item::put_item{},
+                        si_key_attributes(_proxy.data_dictionary().find_table(schema->ks_name(), schema->cf_name()))));
                 auto mut_key = std::make_pair(mutation_builders.back().second.pk(), mutation_builders.back().second.ck());
                 if (used_keys.contains(mut_key)) {
                     return make_ready_future<request_return_type>(api_error::validation("Provided list of item keys contains duplicates"));
@@ -2541,6 +2646,10 @@ public:
     // list of actions, we keep them in an attribute_path_map which groups
     // them by top-level attribute, and detects forbidden overlaps/conflicts.
     attribute_path_map<parsed::update_expression::action> _update_expression;
+ 
+    // Saved list of GSI keys in the table being updated, used for
+    // validate_value_if_gsi_key()
+    std::unordered_map<bytes, std::string> _key_attributes;
 
     parsed::condition_expression _condition_expression;
 
@@ -2619,6 +2728,9 @@ update_item_operation::update_item_operation(service::storage_proxy& proxy, rjso
         throw api_error::validation(
                 format("UpdateItem does not allow both old-style AttributeUpdates and new-style ConditionExpression to be given together"));
     }
+
+    _key_attributes = si_key_attributes(proxy.data_dictionary().find_table(
+        _schema->ks_name(), _schema->cf_name()));
 }
 
 // These are the cases where update_item_operation::apply() needs to use
@@ -2896,6 +3008,9 @@ update_item_operation::apply(std::unique_ptr<rjson::value> previous_item, api::t
             bytes column_value = get_key_from_typed_value(json_value, *cdef);
             row.cells().apply(*cdef, atomic_cell::make_live(*cdef->type, ts, column_value));
         } else {
+            // This attribute may be a key column of one of the GSIs, in which
+            // case there are some limitations on the value.
+            validate_value_if_gsi_key(_key_attributes, column_name, json_value);
             attrs_collector.put(std::move(column_name), serialize_item(json_value), ts);
         }
     };
