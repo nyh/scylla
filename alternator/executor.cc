@@ -53,6 +53,10 @@
 #include "utils/error_injection.hh"
 #include "db/schema_tables.hh"
 #include "utils/rjson.hh"
+#include "alternator/extract_from_attrs.hh"
+#include "column_computation.hh"
+#include "seastar/core/on_internal_error.hh"
+#include "types/types.hh"
 
 using namespace std::chrono_literals;
 
@@ -876,6 +880,97 @@ static void verify_billing_mode(const rjson::value& request) {
     } else {
         throw api_error::validation("Unknown BillingMode={}. Must be PAY_PER_REQUEST or PROVISIONED.");
     }
+}
+
+const bytes extract_from_attrs_column_computation::MAP_NAME = executor::ATTRS_COLUMN_NAME;
+
+column_computation_ptr extract_from_attrs_column_computation::clone() const {
+    return std::make_unique<extract_from_attrs_column_computation>(*this);
+}
+
+// Serialize the *definition* of this column computation into a JSON
+// string with a unique "type" string - TYPE_NAME - which then causes
+// column_computation::deserialize() to create an object from this class.
+bytes extract_from_attrs_column_computation::serialize() const {
+    rjson::value ret = rjson::empty_object();
+    rjson::add(ret, "type", TYPE_NAME);
+    rjson::add(ret, "attr_name", _attr_name);
+    rjson::add(ret, "desired_type", represent_type(_desired_type).ident);
+    return to_bytes(rjson::print(ret));
+}
+
+// Construct a extract_from_attrs_column_computation object based on the
+// saved output of serialize(). Calls on_internal_error() if the string
+// doesn't match the output format of serialize(). "type" is not checked -
+// we assume the caller (column_computation::deserialize()) won't call this
+// constructor if "type" doesn't match.
+extract_from_attrs_column_computation::extract_from_attrs_column_computation(const rjson::value &v) {
+    const rjson::value* attr_name = rjson::find(v, "attr_name");
+    if (attr_name->IsString()) {
+        _attr_name = rjson::to_string_view(*attr_name);
+        const rjson::value* desired_type = rjson::find(v, "desired_type");
+        if (desired_type->IsString()) {
+            _desired_type = type_info_from_string(rjson::to_string_view(*desired_type)).atype;
+            switch (_desired_type) {
+            case alternator_type::S:
+            case alternator_type::B:
+            case alternator_type::N:
+                // We're done
+                return;
+            default:
+                // Fall through to on_internal_error below.
+                break;
+            }
+        }
+    }
+    on_internal_error(elogger, format("Improperly formatted alternator::extract_from_attrs_column_computation computed column definition: {}", v));
+}
+
+std::optional<bytes> extract_from_attrs_column_computation::compute_value(
+        const schema& schema,
+        const partition_key& key,
+        const db::view::clustering_or_static_row& update,
+        const std::optional<db::view::clustering_or_static_row>& existing) const
+{
+    const column_definition* attrs_col = schema.get_column_definition(MAP_NAME);
+    if (!attrs_col || !attrs_col->is_regular() || !attrs_col->is_multi_cell()) {
+        on_internal_error(elogger, "extract_from_attrs_column_computation::compute_value() on a table without an attrs map");
+    }
+    // "found" will be set to the serialized value if available and in
+    // the right type
+    std::optional<bytes> found;
+    // Look for the desired attribute in the attrs map in "update":
+    const atomic_cell_or_collection* attrs = update.cells().find_cell(attrs_col->id);
+    if (attrs) {
+        collection_mutation_view cmv = attrs->as_collection_mutation();
+        found = cmv.with_deserialized(*attrs_col->type, [this] (const collection_mutation_view_description& cmvd) {
+            for (auto&& [key, cell] : cmvd.cells) {
+                if (utf8_type->to_string(key) == _attr_name && cell.is_live()) {
+                    elogger.warn("NYH found in update {} = {}", _attr_name, atomic_cell_view::printer(*bytes_type, cell));
+                    return serialized_value_if_type(to_bytes(cell.value()), _desired_type);
+                }
+            }
+            return std::optional<bytes>(std::nullopt);
+        });
+    }
+    // If not in "update", look for the desired attribute in "existing"
+    if (!found && existing) {
+        // NYH TODO: use lambda to avoid duplication with above code
+        attrs =  existing->cells().find_cell(attrs_col->id);
+        if (attrs) {
+            collection_mutation_view cmv = attrs->as_collection_mutation();
+            found = cmv.with_deserialized(*attrs_col->type, [this] (const collection_mutation_view_description& cmvd) {
+                for (auto&& [key, cell] : cmvd.cells) {
+                    if (utf8_type->to_string(key) == _attr_name && cell.is_live()) {
+                        elogger.warn("NYH found in existing {} = {}", _attr_name, atomic_cell_view::printer(*bytes_type, cell));
+                        return serialized_value_if_type(to_bytes(cell.value()), _desired_type);
+                    }
+                }
+                return std::optional<bytes>(std::nullopt);
+            });
+        }
+    }
+    return found;
 }
 
 static future<executor::request_return_type> create_table_on_shard0(tracing::trace_state_ptr trace_state, rjson::value request, service::storage_proxy& sp, service::migration_manager& mm, gms::gossiper& gossiper) {
