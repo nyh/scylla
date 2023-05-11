@@ -42,7 +42,7 @@ public:
     virtual column_computation_ptr clone() const = 0;
 
     virtual bytes serialize() const = 0;
-    virtual bytes compute_value(const schema& schema, const partition_key& key,
+    virtual std::optional<bytes> compute_value(const schema& schema, const partition_key& key,
         const db::view::clustering_or_static_row& update,
         const std::optional<db::view::clustering_or_static_row>& existing) const = 0;
     // An alternative compute_value() without knowing anything about the row
@@ -85,7 +85,7 @@ public:
     }
     virtual bytes serialize() const override;
     virtual bytes compute_value(const schema& schema, const partition_key& key) const override;
-    virtual bytes compute_value(const schema& schema, const partition_key& key,
+    virtual std::optional<bytes> compute_value(const schema& schema, const partition_key& key,
         const db::view::clustering_or_static_row& update,
         const std::optional<db::view::clustering_or_static_row>& existing) const override;
 };
@@ -109,7 +109,7 @@ public:
     }
     virtual bytes serialize() const override;
     virtual bytes compute_value(const schema& schema, const partition_key& key) const override;
-    virtual bytes compute_value(const schema& schema, const partition_key& key,
+    virtual std::optional<bytes> compute_value(const schema& schema, const partition_key& key,
         const db::view::clustering_or_static_row& update,
         const std::optional<db::view::clustering_or_static_row>& existing) const override;
 };
@@ -151,7 +151,7 @@ public:
     static column_computation_ptr for_target_type(std::string_view type, const bytes& collection_name);
 
     virtual bytes serialize() const override;
-    virtual bytes compute_value(const schema& schema, const partition_key& key,
+    virtual std::optional<bytes> compute_value(const schema& schema, const partition_key& key,
         const db::view::clustering_or_static_row& update,
         const std::optional<db::view::clustering_or_static_row>& existing) const override;
     virtual column_computation_ptr clone() const override {

@@ -614,7 +614,7 @@ public:
 
 private:
     vector_type handle_computed_column(const column_definition& cdef) {
-        bytes computed_value;
+        std::optional<bytes> computed_value;
         if (!cdef.is_computed()) {
             //FIXME(sarna): this legacy code is here for backward compatibility and should be removed
             // once "computed_columns feature" is supported by every node
@@ -629,8 +629,11 @@ private:
             }
             computed_value = computation.compute_value(_base, _base_key, _update, _existing);
         }
-
-        return {managed_bytes_view(linearized_values.emplace_back(std::move(computed_value)))};
+        if (computed_value.has_value()) {
+            return {managed_bytes_view(linearized_values.emplace_back(std::move(*computed_value)))};
+        } else {
+            return {};
+        }
     }
 
     vector_type handle_collection_column_computation(const collection_column_computation* collection_computation) {
@@ -716,6 +719,19 @@ view_updates::get_view_rows(const partition_key& base_key, const clustering_or_s
             }
         }
     } else {
+        // If one of key columns' vectors is empty, it means that
+        // column_computation::compute_value() returned NULL,
+        // and this view row should be skipped.
+        for (const auto& pk_col : pk_elems) {
+            if (pk_col.empty()) {
+                return ret; // return no row
+            }
+        }
+         for (const auto& ck_col : ck_elems) {
+            if (ck_col.empty()) {
+                return ret; // return no row
+            }
+        }
         // Here it's the old regular index over regular values. Each vector has just one element.
         auto get_front = boost::adaptors::transformed([](const auto& v) { return v.front(); });
         compute_row(pk_elems | get_front, ck_elems | get_front);

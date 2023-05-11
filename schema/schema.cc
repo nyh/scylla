@@ -1781,9 +1781,9 @@ bytes legacy_token_column_computation::serialize() const {
 bytes legacy_token_column_computation::compute_value(const schema& schema, const partition_key& key) const {
     return {dht::get_token(schema, key).data()};
 }
-bytes legacy_token_column_computation::compute_value(const schema& schema, const partition_key& key,
+std::optional<bytes> legacy_token_column_computation::compute_value(const schema& schema, const partition_key& key,
         const db::view::clustering_or_static_row& update, const std::optional<db::view::clustering_or_static_row>& existing) const {
-    return {dht::get_token(schema, key).data()};
+    return bytes{dht::get_token(schema, key).data()};
 }
 
 bytes token_column_computation::serialize() const {
@@ -1796,7 +1796,7 @@ bytes token_column_computation::compute_value(const schema& schema, const partit
     auto long_value = dht::token::to_int64(dht::get_token(schema, key));
     return long_type->decompose(long_value);
 }
-bytes token_column_computation::compute_value(const schema& schema, const partition_key& key,
+std::optional<bytes> token_column_computation::compute_value(const schema& schema, const partition_key& key,
         const db::view::clustering_or_static_row& update, const std::optional<db::view::clustering_or_static_row>& existing) const {
     auto long_value = dht::token::to_int64(dht::get_token(schema, key));
     return long_type->decompose(long_value);
@@ -1902,7 +1902,7 @@ void collection_column_computation::operate_on_collection_entries(
     }
 }
 
-bytes collection_column_computation::compute_value(const schema&, const partition_key&, const db::view::clustering_or_static_row& update, const std::optional<db::view::clustering_or_static_row>& existing) const {
+std::optional<bytes> collection_column_computation::compute_value(const schema&, const partition_key&, const db::view::clustering_or_static_row& update, const std::optional<db::view::clustering_or_static_row>& existing) const {
     throw std::runtime_error(fmt::format("{}: not supported", __PRETTY_FUNCTION__));
 }
 
