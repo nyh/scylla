@@ -1731,14 +1731,14 @@ static inline void validate_value_if_gsi_key(
     // member, whose key and value are strings)
     std::string_view value_type = rjson::to_string_view(value.MemberBegin()->name);
     if (expected_type != value_type) {
-        throw api_error::validation(format(
+        throw api_error::validation(fmt::format(
             "Type mismatch: expected type {} for GSI key attribute {}, got type {}",
-            expected_type, attribute, value_type));
+            expected_type, to_sstring_view(attribute), value_type));
     }
     std::string_view value_content = rjson::to_string_view(value.MemberBegin()->value);
     if (value_content.empty()) {
-        throw api_error::validation(format(
-            "GSI key attribute {} cannot be set to an empty string", attribute));
+        throw api_error::validation(fmt::format(
+            "GSI key attribute {} cannot be set to an empty string", to_sstring_view(attribute)));
     }
 }
 
