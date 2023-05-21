@@ -2000,3 +2000,22 @@ def test_gsi_invalid_key_types(dynamodb):
                 }]) as table:
                 pass
 
+# NYH CONTINUE: think if we need has_base_non_pk_columns_in_view_pk
+#  and if it's fine or not we don't set it.
+# NYH CONTINUE: upgrade tests. mixed cluster, etc.
+# NYH CONTINUE: in upgrade test: don't allow deleting old GSI when its
+#               key is a real column, but! allow deleting an old GSI when
+#               its key is also a LSI key (which can't be removed)
+# NYH CONTINUE WRITING TESTS:
+# * write a test that if we create a table with an LSI and
+#               and a GSI, the LSI can't be removed but the GSI can.
+#               Use the same key or different key (parametrize) for
+#               the GSI and LSI.
+# * start a table with LSI and add GSI later. @pytest.mark.xfail(reason="issue #11567")
+
+# NYH TODO: write a LSI+GSI test where column x must be a real column because
+# it is a LSI key, and x,y is a GSI key (two base regular columns!), so
+# adding/deleting x,y (see scenarios in test_gsi_3_long) will need to
+# add/delete columns.
+# NYH TODO: also check a write that sets the same value (we used to have
+# a bug with that).
