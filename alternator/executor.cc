@@ -1126,51 +1126,38 @@ extract_from_attrs_column_computation::extract_from_attrs_column_computation(con
     on_internal_error(elogger, format("Improperly formatted alternator::extract_from_attrs_column_computation computed column definition: {}", v));
 }
 
-std::optional<bytes> extract_from_attrs_column_computation::compute_value(
+regular_column_transformation::result extract_from_attrs_column_computation::compute_value(
         const schema& schema,
         const partition_key& key,
-        const db::view::clustering_or_static_row& update,
-        const std::optional<db::view::clustering_or_static_row>& existing) const
+        const db::view::clustering_or_static_row& row) const
 {
     const column_definition* attrs_col = schema.get_column_definition(MAP_NAME);
     if (!attrs_col || !attrs_col->is_regular() || !attrs_col->is_multi_cell()) {
         on_internal_error(elogger, "extract_from_attrs_column_computation::compute_value() on a table without an attrs map");
     }
-    // "found" will be set to the serialized value if available and in
-    // the right type
-    std::optional<bytes> found;
-    // Look for the desired attribute in the attrs map in "update":
+    // Look for the desired attribute _attr_name in the attrs_col map in row:
     const atomic_cell_or_collection* attrs = update.cells().find_cell(attrs_col->id);
-    if (attrs) {
-        collection_mutation_view cmv = attrs->as_collection_mutation();
-        found = cmv.with_deserialized(*attrs_col->type, [this] (const collection_mutation_view_description& cmvd) {
-            for (auto&& [key, cell] : cmvd.cells) {
-                if (utf8_type->to_string(key) == _attr_name && cell.is_live()) {
-                    elogger.warn("NYH found in update {} = {}", _attr_name, atomic_cell_view::printer(*bytes_type, cell));
-                    return serialized_value_if_type(to_bytes(cell.value()), _desired_type);
+    if (!attrs) {
+        return regular_column_transformation::result::missing_value();
+    }
+    collection_mutation_view cmv = attrs->as_collection_mutation();
+    return cmv.with_deserialized(*attrs_col->type, [this] (const collection_mutation_view_description& cmvd) {
+        for (auto&& [key, cell] : cmvd.cells) {
+            if (utf8_type->to_string(key) == _attr_name) {
+                if (cell.is_live()) {
+                    elogger.warn("NYH compute_value alive {} = {}", _attr_name, atomic_cell_view::printer(*bytes_type, cell));
+                    return regular_column_transformation::result::value(
+                        serialized_value_if_type(to_bytes(cell.value()), _desired_type),
+                        cell.timestamp());
+                } else {
+                    elogger.warn("NYH compute_value deleted {} = {}", _attr_name, atomic_cell_view::printer(*bytes_type, cell));
+                    return regular_column_transformation::result::deleted_value(cell.timestamp());
                 }
             }
-            return std::optional<bytes>(std::nullopt);
-        });
-    }
-    // If not in "update", look for the desired attribute in "existing"
-    if (!found && existing) {
-        // NYH TODO: use lambda to avoid duplication with above code
-        attrs =  existing->cells().find_cell(attrs_col->id);
-        if (attrs) {
-            collection_mutation_view cmv = attrs->as_collection_mutation();
-            found = cmv.with_deserialized(*attrs_col->type, [this] (const collection_mutation_view_description& cmvd) {
-                for (auto&& [key, cell] : cmvd.cells) {
-                    if (utf8_type->to_string(key) == _attr_name && cell.is_live()) {
-                        elogger.warn("NYH found in existing {} = {}", _attr_name, atomic_cell_view::printer(*bytes_type, cell));
-                        return serialized_value_if_type(to_bytes(cell.value()), _desired_type);
-                    }
-                }
-                return std::optional<bytes>(std::nullopt);
-            });
         }
-    }
-    return found;
+        elogger.warn("NYH compute_value missing {} = {}", _attr_name, atomic_cell_view::printer(*bytes_type, cell));
+        return regular_column_transformation::result::missing_value();
+    });
 }
 
 static future<executor::request_return_type> create_table_on_shard0(service::client_state&& client_state, tracing::trace_state_ptr trace_state, rjson::value request, service::storage_proxy& sp, service::migration_manager& mm, gms::gossiper& gossiper, bool enforce_authorization) {

@@ -10,6 +10,7 @@
 
 #include "bytes.hh"
 #include <memory>
+#include "timestamp.hh"
 
 class schema;
 class partition_key;
@@ -95,6 +96,53 @@ public:
     }
     virtual bytes serialize() const override;
     virtual bytes compute_value(const schema& schema, const partition_key& key) const override;
+};
+
+// In the basic column_computation above, compute_value() is only based on
+// the partition key. That has very limited applications - basically just
+// token_column_computation above. The regular_column_transformation below
+// is more powerful, but still is not a completely general computation: It
+// promises to transform the value read from a single regular column in a row.
+// In more details, the assumptions of regular_column_transformation is:
+// 1. compute_value() computes the value based on a *single* column in a
+//    row passed to compute_value().
+//    This assumption means that the value or deletion of the value always
+//    has a single known timestamp (and the value can't be half-missing).
+// 2. The source is a *regular* column in the base table. This means that an
+//    update can modify it (unlike a base-table key column that can't change
+//    in an update) so we may need to read the value before and after the
+//    update, and delete and create view rows.
+// 3. compute_value() can return 1. a value, or 2. "missing" if the column
+//    to be transformed is missing from the given row, or 3. "deleted"
+//    if the row contains a deletion (a tombstone) for the column.
+// The distinction between "missing" and "deleted" is important, because
+// when the given row is an update mutation, there is a difference between
+// the value missing in the update (the update didn't change the existing
+// value of that column) and the value being deleted by the update.
+class regular_column_transformation : public column_computation {
+public:
+    struct result {
+        std::optional<bytes> _value;
+        bool _deleted; // if set, "value" is irrelevant
+        // timestamp of live or deleted value. If !_deleted && !_value,
+        // ts is undefined.
+        api::timestamp_type _ts;
+
+        static result deleted_value(api::timestamp_type ts) {
+            return result{std::nullopt, true, ts};
+        }
+        static result missing_value() {
+            return result{std::nullopt, false, 0};
+        }
+        static result value(std::optional<bytes>&& v, api::timestamp_type ts) {
+            return result{std::move(v), false, ts};
+        }
+    };
+    virtual ~regular_column_transformation() = default;
+    virtual result compute_value(
+        const schema& schema,
+        const partition_key& key,
+        const db::view::clustering_or_static_row& row) const = 0;
 };
 
 /*

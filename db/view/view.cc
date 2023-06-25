@@ -1152,6 +1152,50 @@ void view_updates::update_entry_for_computed_column(
     }
 }
 
+// NYH TRY:
+// Extract a view key from a base partition-key and base row (before or after
+// an update). The view key components may come from either real base columns
+// or from computed columns based on base columns.
+// If any of the view key components is null, this view row should be skipped
+// entirely, so this function returns null.
+// BUT - I think we need to return a add/delete timestamp, no????
+// 
+?? get_view_key
+    vector_type operator()(const column_definition& cdef) {
+        column_position++;
+
+        // Note that in the following lines, if the key column exists in the
+        // base table, then it will be used and the requested computed column
+        // will be outright ignored.
+        // I'm not sure why we chose this surprising logic, but it turns out
+        // to be useful in Alternator when combining an LSI (which puts its
+        // key attribute a real base column) and GSI (which uses a computed
+        // column) - and this logic means the GSI will read the real column
+        // stored by the LSI, which turns out to be the right thing to do
+        // (see the test test_gsi.py::test_gsi_and_lsi_same_key).
+        auto* base_col = _base.get_column_definition(cdef.name());
+        if (!base_col) {
+            return handle_computed_column(cdef);
+        }
+        switch (base_col->kind) {
+        case column_kind::partition_key:
+            return {_base_key.get_component(_base, base_col->position())};
+        case column_kind::clustering_key:
+            if (_update.is_static_row()) {
+                on_internal_error(vlogger, "Tried to get view row value for a static row update in a view with partition key having clustering columns from original table");
+            }
+            return {_update.key()->get_component(_base, base_col->position())};
+        default:
+            if (base_col->kind != _update.column_kind()) {
+                on_internal_error(vlogger, format("Tried to get a {} column from a {} row update, which is impossible",
+                        to_sstring(base_col->kind), _update.is_clustering_row() ? "clustering" : "static"));
+            }
+            auto& c = _update.cells().cell_at(base_col->id);
+            auto value_view = base_col->is_atomic() ? c.as_atomic_cell(cdef).value() : c.as_collection_mutation().data;
+            return {managed_bytes_view{value_view}};
+        }
+
+
 void view_updates::generate_update(
         data_dictionary::database db,
         const partition_key& base_key,
@@ -1175,6 +1219,30 @@ void view_updates::generate_update(
     if (_view_info.has_computed_column_depending_on_base_non_primary_key()) {
         return update_entry_for_computed_column(base_key, update, existing, now);
     }
+    // NYH CONTINUE HERE: calculate here view_key_existing and view_key_update
+    // which is the view row's key in existing and in update. Then use it in all
+    // code below instead of repeating it in a hacky way in has_old_row, has_new_row,
+    // *_entry(), get_view_rows(), and so on.
+    // If one of the view key columns is a regular_column_transformation (perhaps
+    // pre-compute as if in has_computed_* above) we use the computed column to
+    // calculate it, otherwise we copy it from the base (like we do in code below). 
+    // Modify all the code below (*_entry(), get_view_rows(), etc.) to take
+    // the view_keys_* separately instead of recalculating it all the time. 
+    // The has_old_row, has_new_row, and so on, will be based on checking if any of the
+    // view key columns is listed as deleted/missing appropriately (e.g., deleted in
+    // the update, or deleted in the existing and missing in the update).
+    // We also need the before-and-after key to be able to compare if it's the same key
+    // (maybe if there are missing values in update we need to copy them from existing)
+    //
+    // The !_base_info->has_base_non_pk_columns_in_view_pk case is simpler - the
+    // view key is the same for existing and update and there are no computed columns,
+    // so perhaps we don't need to modify it at all.
+    //
+    // NYH TODO: if the update didn't change a column, is it missing in "update" or
+    // copied from "existing"? Is this also true for a map - is the whole map
+    // copied or just the changed attribute? We need to verify we have tests for
+    // this (updates that change some attribute which is not the view key).
+
     if (!_base_info->has_base_non_pk_columns_in_view_pk) {
         if (update.is_static_row()) {
             // TODO: support static rows in views with pk only including columns from base pk

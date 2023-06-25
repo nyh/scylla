@@ -22,7 +22,7 @@ namespace alternator {
 // and deserializes it if it has the desired type. This computed column
 // will be used as a materialized-view key when the view key attribute
 // isn't a full-fledged CQL column but rather stored in ":attrs".
-class extract_from_attrs_column_computation : public column_computation {
+class extract_from_attrs_column_computation : public regular_column_transformation {
     // The name of the CQL column name holding the attribute map. It is a
     // constant (usually ":attrs"), so doesn't need to be specified when
     // constructing the column computation.
@@ -54,9 +54,9 @@ public:
     extract_from_attrs_column_computation(std::string_view attr_name, alternator_type desired_type)
         : _attr_name(attr_name), _desired_type(desired_type)
         {}
-    virtual std::optional<bytes> compute_value(const schema& schema, const partition_key& key,
-        const db::view::clustering_or_static_row& update,
-        const std::optional<db::view::clustering_or_static_row>& existing) const override;
+    regular_column_transformation::result compute_value(const schema& schema, const partition_key& key,
+        const db::view::clustering_or_static_row& row) const override;
+    // NYH: get rid of this
     // NYH: I don't know what this is for. returning "true" here causes code
     // in view.cc to find has_computed_column_depending_on_base_non_primary_key
     // and do wrong things! I don't understand why.
