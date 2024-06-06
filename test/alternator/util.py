@@ -238,3 +238,23 @@ def scylla_inject_error(rest_api, err, one_shot=False):
 def scylla_log(optional_rest_api, message, level):
     if optional_rest_api:
         requests.post(f'{optional_rest_api}/system/log?message={requests.utils.quote(message)}&level={level}')
+
+# Read a parameter from Scylla's configuration, stored in the system table
+# which is also visible to Alternator. This function will only work on Scylla,
+# and fail otherwise, so should only be used in Scylla-only tests.
+# If this is Scylla, but the specific parameter name is not present in the
+# configuration, this function returns None. If the parameter is present,
+# it is returned (as a string).
+def scylla_config_read(dynamodb, name):
+    config_table = dynamodb.Table('.scylla.alternator.system.config')
+    # We use query() here instead of the simpler get_item(), because
+    # commit 44a1daf only added support for system tables in Query and
+    # Scan, not in GetItem...
+    r = config_table.query(
+            KeyConditionExpression='#key=:val',
+            ExpressionAttributeNames={'#key': 'name'},
+            ExpressionAttributeValues={':val': name}
+        )
+    if not 'Items' in r:
+        return None
+    return r['Items'][0]['value']
