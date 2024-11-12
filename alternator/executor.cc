@@ -1136,7 +1136,7 @@ regular_column_transformation::result extract_from_attrs_column_computation::com
         on_internal_error(elogger, "extract_from_attrs_column_computation::compute_value() on a table without an attrs map");
     }
     // Look for the desired attribute _attr_name in the attrs_col map in row:
-    const atomic_cell_or_collection* attrs = update.cells().find_cell(attrs_col->id);
+    const atomic_cell_or_collection* attrs = row.cells().find_cell(attrs_col->id);
     if (!attrs) {
         return regular_column_transformation::result::missing_value();
     }
@@ -1155,10 +1155,17 @@ regular_column_transformation::result extract_from_attrs_column_computation::com
                 }
             }
         }
-        elogger.warn("NYH compute_value missing {} = {}", _attr_name, atomic_cell_view::printer(*bytes_type, cell));
+        elogger.warn("NYH compute_value missing {}", _attr_name);
         return regular_column_transformation::result::missing_value();
     });
 }
+
+// extract_from_attrs_column_computation needs the whole row to compute
+// value, it cann't use just the partition key.
+bytes extract_from_attrs_column_computation::compute_value(const schema&, const partition_key&) const {
+    throw std::runtime_error(fmt::format("{}: not supported", __PRETTY_FUNCTION__));
+}
+
 
 static future<executor::request_return_type> create_table_on_shard0(service::client_state&& client_state, tracing::trace_state_ptr trace_state, rjson::value request, service::storage_proxy& sp, service::migration_manager& mm, gms::gossiper& gossiper, bool enforce_authorization) {
     SCYLLA_ASSERT(this_shard_id() == 0);

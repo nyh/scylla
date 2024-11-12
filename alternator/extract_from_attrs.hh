@@ -54,15 +54,16 @@ public:
     extract_from_attrs_column_computation(std::string_view attr_name, alternator_type desired_type)
         : _attr_name(attr_name), _desired_type(desired_type)
         {}
-    regular_column_transformation::result compute_value(const schema& schema, const partition_key& key,
+    result compute_value(const schema& schema, const partition_key& key,
         const db::view::clustering_or_static_row& row) const override;
-    // NYH: get rid of this
-    // NYH: I don't know what this is for. returning "true" here causes code
-    // in view.cc to find has_computed_column_depending_on_base_non_primary_key
-    // and do wrong things! I don't understand why.
-    // Instead, maybe we need to somehow set has_base_non_pk_columns_in_view_pk???
+    // This class does not implement the base class's compute_value that has
+    // only a partition key.
+    bytes compute_value(const schema& schema, const partition_key& key) const override;
+    // This computed column does depend on a non-primary key column, so
+    // its result may change in the update and we need to compute it
+    // before and after the update.
     virtual bool depends_on_non_primary_key_column() const override {
-        return false;
+        return true;
     }
 };
 } // namespace alternator

@@ -680,6 +680,11 @@ private:
         if (auto* collection_computation = dynamic_cast<const collection_column_computation*>(&computation)) {
             return handle_collection_column_computation(collection_computation);
         }
+        // NYH: I don't know if I should do this here, what a mess :-( I don't know ifwe can convert the regular column transformation into "actions"
+        // it doesn't make sense to do it for one column if the key has multiple columns...
+        if (auto* c = dynamic_cast<const regular_column_transformation*>(&computation)) {
+            throw std::logic_error("Got to handle_computed_column() with regular_column_transformation");
+        }
 
         auto computed_value = computation.compute_value(_base, _base_key);
         return {managed_bytes_view(linearized_values.emplace_back(std::move(computed_value)))};
@@ -697,6 +702,7 @@ private:
         }
         return ret;
     }
+    
 };
 }
 
@@ -1152,14 +1158,14 @@ void view_updates::update_entry_for_computed_column(
     }
 }
 
-// NYH TRY:
 // Extract a view key from a base partition-key and base row (before or after
-// an update). The view key components may come from either real base columns
+// an update). Each view key component may come from either a real base column
 // or from computed columns based on base columns.
 // If any of the view key components is null, this view row should be skipped
 // entirely, so this function returns null.
 // BUT - I think we need to return a add/delete timestamp, no????
 // 
+#if 0
 ?? get_view_key
     vector_type operator()(const column_definition& cdef) {
         column_position++;
@@ -1194,8 +1200,50 @@ void view_updates::update_entry_for_computed_column(
             auto value_view = base_col->is_atomic() ? c.as_atomic_cell(cdef).value() : c.as_collection_mutation().data;
             return {managed_bytes_view{value_view}};
         }
+#endif
 
-
+void view_updates::generate_update(
+        data_dictionary::database db,
+        const partition_key& base_key,
+        const clustering_or_static_row& update,
+        const std::optional<clustering_or_static_row>& existing,
+        gc_clock::time_point now) {
+    // "update" always includes the *base* table's key columns (but possibly
+    // not the view's additional key columns if there's any) because an update
+    // to the base table needs to specify its keep. However, supposedly in a
+    // compact-storage table an update might be missing part of the clustering
+    // key. Such an update cannot be copied to the view.
+    // FIXME: if this is a real case, refer to a test that demonstrates it. If
+    // it's not a real case, remove this if().
+    if (update.is_clustering_row() && !update.key()->is_full(*_base)) {
+        return;
+    }
+    // If the view key depends on any regular column in the base, the update
+    // may change the view key and may require deleting an old view row and
+    // inserting a new row. The other case, which we'll handle now, is easier
+    // and require just modifying one view row.
+    if (!_base_info->has_base_non_pk_columns_in_view_pk &&
+        !_view_info.has_computed_column_depending_on_base_non_primary_key()) {
+        vlogger.warn("NYH got to same-view-key case");
+        if (update.is_static_row()) {
+            // TODO: support static rows in views with pk only including columns from base pk
+            return;
+        }
+        // The view key is necessarily the same pre and post update.
+        if (existing && existing->is_live(*_base)) {
+            if (update.is_live(*_base)) {
+                update_entry(db, base_key, update, *existing, now);
+            } else {
+                delete_old_entry(db, base_key, *existing, update, now);
+            }
+        } else if (update.is_live(*_base)) {
+            create_entry(db, base_key, update, now);
+        }
+        return;
+    }
+    vlogger.warn("NYH got to new-view-key-column case");
+}
+#if 0
 void view_updates::generate_update(
         data_dictionary::database db,
         const partition_key& base_key,
@@ -1216,7 +1264,15 @@ void view_updates::generate_update(
         }
     }
 
+    // NYH TODO: Because regular_column_transformation doesn't set
+    // has_base_non_pk_columns_in_view_pk we made it return true for
+    // depends_on_non_primary_key_column and now we reach this if.
+    // But the code we run for this if appears to have been designed
+    // just for collection column indexing and can't work for our new
+    // need of GSI indexing. This code seems to bypass all the important
+    // before-and-after code we have below.
     if (_view_info.has_computed_column_depending_on_base_non_primary_key()) {
+        vlogger.warn("NYH calling update_entry_for_computed_column");
         return update_entry_for_computed_column(base_key, update, existing, now);
     }
     // NYH CONTINUE HERE: calculate here view_key_existing and view_key_update
@@ -1243,7 +1299,13 @@ void view_updates::generate_update(
     // copied or just the changed attribute? We need to verify we have tests for
     // this (updates that change some attribute which is not the view key).
 
+
     if (!_base_info->has_base_non_pk_columns_in_view_pk) {
+        // NYH CONTINUE HERE: test_gsi.py::test_gsi_2
+        // We reach this case even though we have a computed column based
+        // on a non-pk column. Perhaps if there are any regular_column_transformation
+        // computed columns, we need to set this boolean to true!!
+        vlogger.warn("NYH got to same-view-key case");
         if (update.is_static_row()) {
             // TODO: support static rows in views with pk only including columns from base pk
             return;
@@ -1260,6 +1322,15 @@ void view_updates::generate_update(
         }
         return;
     }
+
+    vlogger.warn("NYH got to new-view-key-column case");
+    // NYH TODO: calculate the before and after view key once,
+    // here, to avoid doing it in get_rows() (which calls the computed column)
+    // inside the different *_entry functions. BUT, how will collection indexing
+    // continue to work?
+    // Maybe we should add the row to the ordinary computed column, otherwise
+    // when executing the computed column we need to check if it's a base
+    // computed column or a regular_column_transformation.
 
     const auto& col_ids = update.is_clustering_row()
             ? _base_info->base_regular_columns_in_view_pk()
@@ -1331,6 +1402,7 @@ void view_updates::generate_update(
         create_entry(db, base_key, update, now);
     }
 }
+#endif
 
 bool view_updates::is_partition_key_permutation_of_base_partition_key() const {
     return _view_info.is_partition_key_permutation_of_base_partition_key();

@@ -119,6 +119,8 @@ public:
 // when the given row is an update mutation, there is a difference between
 // the value missing in the update (the update didn't change the existing
 // value of that column) and the value being deleted by the update.
+// NYH TODO: do we ever have update-only or is it always existing+update
+// merged? If it's the latter, than the "missing" case is maybe less important?
 class regular_column_transformation : public column_computation {
 public:
     struct result {
