@@ -1242,6 +1242,56 @@ void view_updates::generate_update(
         return;
     }
     vlogger.warn("NYH got to new-view-key-column case");
+
+    // Find the view key columns that may have been changed by the update.
+    // In other words, view key columns that are not base key columns or
+    // computed columns based just on key columns.
+    // This includes columns which were regular columns or static columns in
+    // the base table, or computed columns based on regular columns.
+    // TODO: cache this computation in _base_info like we set
+    // base_regular_columns_in_view_pk and base_static_columns_in_view_pk.
+    // Also, I don't understand all the base-view-schema-lifetime issues :-(
+    //std::vector<column_id> variable_view_key_cols;
+    struct updatable_view_key_col {
+        column_id view_col_id;
+        regular_column_transformation::result before;
+        regular_column_transformation::result after;
+    };
+    std::vector<updatable_view_key_col> updatable_view_key_cols;
+    for (const column_definition& view_col : _view->primary_key_columns()) {
+        if (view_col.is_computed()) {
+            const column_computation& computation = view_col.get_computation();
+            if (computation.depends_on_non_primary_key_column()) {
+                //variable_view_key_cols.push_back(view_col.id);
+                if (auto* c = dynamic_cast<const regular_column_transformation*>(&computation)) {
+                    updatable_view_key_cols.emplace_back(view_col.id,
+                        existing ? c->compute_value(*_base, base_key, *existing) : regular_column_transformation::result::missing_value(),
+                        c->compute_value(*_base, base_key, update));
+                } else {
+                    // unexpected, we don't have other computers that depend on primary key column
+                    abort();
+                }
+            }
+        } else {
+            const column_definition* base_col = _base->get_column_definition(view_col.name());
+            if (!base_col) {
+                on_internal_error(vlogger, fmt::format("Column {} in view {}.{} was not found in the base table {}.{}",
+                    view_col.name(), _view->ks_name(), _view->cf_name(), _base->ks_name(), _base->cf_name()));
+            }
+            // TODO: according to the old code, it seems that if the update is a
+            // regular row we only need to look at the regular columns in the base,
+            // if the update is a static row we only need to check for base static
+            // rows. So if we cache this, we need to cache two verison - like
+            // we had base_regular/static_columns_in_view_pk. But I don't understand why.
+            if (!base_col->is_primary_key()) {
+                //variable_view_key_cols.push_back(view_col.id);
+                // CONTINUE HERE: non-computed columns
+                abort();
+            }
+        }
+    }
+    //vlogger.warn("NYH variable_view_key_cols is {}", variable_view_key_cols);
+
 }
 #if 0
 void view_updates::generate_update(
