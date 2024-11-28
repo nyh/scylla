@@ -125,7 +125,7 @@ class regular_column_transformation : public column_computation {
 public:
     struct result {
         std::optional<bytes> _value;
-        bool _deleted; // if set, "value" is irrelevant
+        bool _deleted; // if _deleted, "value" is unset
         // timestamp of live or deleted value. If !_deleted && !_value,
         // ts is undefined.
         api::timestamp_type _ts;
@@ -138,6 +138,23 @@ public:
         }
         static result value(std::optional<bytes>&& v, api::timestamp_type ts) {
             return result{std::move(v), false, ts};
+        }
+        bool has_value() const {
+            return _value.has_value();
+        }
+        // Should only be called if has_value() is true
+        const bytes& get_value() const {
+            return *_value;
+        }
+        bool is_deleted() const {
+            return _deleted;
+        }
+        bool is_missing() const {
+            return !has_value() && !is_deleted();
+        }
+        // Should only be called if has_value() or is_deleted() (i.e., !is_missing())
+        api::timestamp_type get_ts() const {
+            return _ts;
         }
     };
     virtual ~regular_column_transformation() = default;
