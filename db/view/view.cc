@@ -695,7 +695,7 @@ private:
             //regular_column_transformation::result before = _existing ? 
             //    c->compute_value(_base, _base_key, *_existing) : regular_column_transformation::result::missing_value();
             if (after.has_value()) {
-                vlogger.warn("NYH handle_computed_column case after.has_value {}", after.get_value());
+                    vlogger.warn("NYH {} handle_computed_column case after.has_value {}", cdef.name_as_text(), after.get_value());
                 return {managed_bytes_view(linearized_values.emplace_back(after.get_value()))};
             }
             if (_existing) {
@@ -705,7 +705,7 @@ private:
                 regular_column_transformation::result before =
                     c->compute_value(_base, _base_key, *_existing);
                 if (before.has_value()) {
-                    vlogger.warn("NYH handle_computed_column case before.has_value");
+                    vlogger.warn("NYH {} handle_computed_column case before.has_value {}", cdef.name_as_text(), before.get_value());
                     return {managed_bytes_view(linearized_values.emplace_back(before.get_value()))};
                 }
             }
@@ -743,6 +743,8 @@ view_updates::get_view_rows(const partition_key& base_key, const clustering_or_s
 
     std::vector<value_getter::vector_type> pk_elems, ck_elems;
     std::ranges::copy(_view->partition_key_columns() | get_value, std::back_inserter(pk_elems));
+    vlogger.warn("NYH get_view_rows {} partition key columns, {} pk_elems", _view->partition_key_columns().size(), pk_elems.size());
+    for (auto &x : pk_elems) { for(auto&y : x) { vlogger.warn("NYH get_view_rows pk_elem mkva {}", y._key_view); }}
     // If no collection column was found, each of the actions will contain no_action,
     // in particular, it does not harm to use column 0.
     const bool had_multiple_values_in_pk = bool(getter.collection_column_position);
@@ -758,15 +760,16 @@ view_updates::get_view_rows(const partition_key& base_key, const clustering_or_s
         partition_key pkey = partition_key::from_range(boost::adaptors::transform(pk, view_managed_key_view_and_action::get_key_view));
         clustering_key ckey = clustering_key::from_range(boost::adaptors::transform(ck, view_managed_key_view_and_action::get_key_view));
         auto action = (action_column < pk.size() ? pk[action_column] : ck[action_column - pk.size()])._action;
+        vlogger.warn("NYH get_view_rows compute_row pkey={}, ckey={}", pkey, ckey);
         mutation_partition& partition = partition_for(std::move(pkey));
 
         // Skip adding the row if we already wrote a partition tombstone for this partition, and the update
         // is deleting the row with an equal row tombstone. This means the entire partition is deleted
         // so we don't need to generate updates for individual rows.
         if (partition.partition_tombstone() && partition.partition_tombstone() == row_delete_tomb.tomb()) {
+            vlogger.warn("NYH get_view_rows early return");
             return;
         }
-        vlogger.warn("NYH get_view_rows compute_row ckey={}", ckey);
         ret.push_back({&partition.clustered_row(*_view, std::move(ckey)), action});
     };
 
@@ -810,9 +813,9 @@ view_updates::get_view_rows(const partition_key& base_key, const clustering_or_s
             }
         }
     } else {
-        vlogger.warn("NYH get_view_rows good old case");
         // Here it's the old regular index over regular values. Each vector has just one element.
         auto get_front = boost::adaptors::transformed([](const auto& v) { return v.front(); });
+        vlogger.warn("NYH get_view_rows good old case");
         compute_row(pk_elems | get_front, ck_elems | get_front);
     }
 
@@ -1013,7 +1016,7 @@ void view_updates::do_delete_old_entry(const partition_key& base_key, const clus
     auto view_rows = get_view_rows(base_key, existing, std::nullopt, update.tomb());
     const auto kind = existing.column_kind();
     for (const auto& [r, action] : view_rows) {
-        vlogger.warn("NYH do_delete_old_entry row {} ts {}", deletable_row::printer(*_base,*r), deletion_ts);
+        vlogger.warn("NYH do_delete_old_entry row {} ts {}", deletable_row::printer(*_view,*r), deletion_ts);
         const auto& col_ids = existing.is_clustering_row()
                 ? _base_info->base_regular_columns_in_view_pk()
                 : _base_info->base_static_columns_in_view_pk();
@@ -1031,6 +1034,7 @@ void view_updates::do_delete_old_entry(const partition_key& base_key, const clus
                     utils::on_internal_error("NYH do_delete_old_entry unexpected missing timestamp");
                 }
                 r->apply(shadowable_tombstone(deletion_ts, now));
+                vlogger.warn("NYH do_delete_old_entry case A2 after apply {}", deletable_row::printer(*_view,*r));
             }
         } else if (!col_ids.empty()) {
             vlogger.warn("NYH do_delete_old_entry case B");
@@ -1407,7 +1411,9 @@ void view_updates::generate_update(
                 // NYH: until we pass the entire updatable_view_key_cols we
                 // need to pass the ts.
                 delete_old_entry(db, base_key, *existing, update, now, old_row_ts);
+                for(auto&x : _updates) { vlogger.warn("NYH generate_update delete_old_entry B, pk={} partition={}", x.first, mutation_partition::printer(*_view, x.second)); }
                 create_entry(db, base_key, update, now);
+                for(auto&x : _updates) { vlogger.warn("NYH generate_update after also create_entry B, pk={} partition={}", x.first, mutation_partition::printer(*_view, x.second)); }
             }
         } else {
             delete_old_entry(db, base_key, *existing, update, now, old_row_ts);
@@ -1627,6 +1633,7 @@ bool view_updates::generate_partition_tombstone_update(
         return false;
     }
 
+    vlogger.warn("NYH generate_partition_tombstone_update applying partition tombstone to view update");
     // Apply the partition tombstone on the view partition
     mutation_partition& mp = partition_for(std::move(*view_key_opt));
     mp.apply(partition_tomb);
