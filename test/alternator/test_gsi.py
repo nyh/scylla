@@ -385,6 +385,12 @@ def test_update_gsi_pk(test_table_gsi_2):
     assert_index_query(test_table_gsi_2, 'hello', [{'p': p, 'x': x1, 'y': y, 'z': z}],
         KeyConditions={'x': {'AttributeValueList': [x1], 'ComparisonOperator': 'EQ'}})
 
+    # NYH CONTINUE HERE: uncommenting these lines, calling update_entry()
+    # break this test. Why? I think we get a wrong timestamp on a modified
+    # row marker, but why? Maybe because update_items() calls get_view_rows
+    # with just update, not existing? I need to debug what gets called
+    # from update_entry()
+
     # Update only the unrelated attribute y. Should leave the same row in
     # the GSI (x=x1), just with a modified y (and unmodified z)
     y = random_string()

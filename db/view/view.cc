@@ -559,6 +559,7 @@ row_marker view_updates::compute_row_marker(const clustering_or_static_row& base
      *     (and that of the row marker we return) is the later of these two
      *     updated columns.
      */
+    // NYH CONTINUE HERE: compute_row_marker() isn't ready for the case of the computed column as the key. Can we take something like deletion_ts from the caller?
     const auto& col_ids = base_row.is_clustering_row()
             ? _base_info->base_regular_columns_in_view_pk()
             : _base_info->base_static_columns_in_view_pk();
@@ -977,14 +978,16 @@ static void add_cells_to_view(const schema& base, const schema& view, column_kin
  * Creates a view entry corresponding to the provided base row.
  * This method checks that the base row does match the view filter before applying anything.
  */
-void view_updates::create_entry(data_dictionary::database db, const partition_key& base_key, const clustering_or_static_row& update, gc_clock::time_point now) {
+void view_updates::create_entry(data_dictionary::database db, const partition_key& base_key, const clustering_or_static_row& update, gc_clock::time_point now, api::timestamp_type ts) {
     vlogger.warn("NYH create_entry");
     if (!matches_view_filter(db, *_base, _view_info, base_key, update, now)) {
         return;
     }
 
     auto view_rows = get_view_rows(base_key, update, std::nullopt, {});
-    auto update_marker = compute_row_marker(update);
+    // NYH: we should get the timestamp from the caller, but I'm not sure if I fixed all the callers so let's allow missing timestamp and call compute_row_marker
+    // NYH TODO: need to get not just ts but also ttl and expiry.... :-( This code probably won't work when there is ttl and expiry (it doesn't happen in Alternator, but still...)
+    auto update_marker = (ts == api::missing_timestamp) ? compute_row_marker(update) : row_marker(ts);
     const auto kind = update.column_kind();
     for (const auto& [r, action]: view_rows) {
         if (auto rm = std::get_if<row_marker>(&action)) {
@@ -1061,6 +1064,7 @@ void view_updates::do_delete_old_entry(const partition_key& base_key, const clus
                 r->apply(shadowable_tombstone(ts, now));
             }
         } else {
+            // NYH CONTINUE HERE: WHAT IS THIS CASE? AM I MISSING IT?
             vlogger.warn("NYH do_delete_old_entry case C");
             // "update" caused the base row to have been deleted, and !col_id
             // means view row is the same - so it needs to be deleted as well
@@ -1153,25 +1157,32 @@ bool view_updates::can_skip_view_updates(const clustering_or_static_row& update,
  * This method checks that the base row (before and after) matches the view filter before
  * applying anything.
  */
-void view_updates::update_entry(data_dictionary::database db, const partition_key& base_key, const clustering_or_static_row& update, const clustering_or_static_row& existing, gc_clock::time_point now) {
-    vlogger.warn("NYH update_entry");
+void view_updates::update_entry(data_dictionary::database db, const partition_key& base_key, const clustering_or_static_row& update, const clustering_or_static_row& existing, gc_clock::time_point now, api::timestamp_type ts) {
+    vlogger.warn("NYH update_entry ts={}", ts);
     // While we know update and existing correspond to the same view entry,
     // they may not match the view filter.
     if (!matches_view_filter(db, *_base, _view_info, base_key, existing, now)) {
-        create_entry(db, base_key, update, now);
+        vlogger.warn("NYH update_entry create_entry case", ts);
+        create_entry(db, base_key, update, now, ts);
         return;
     }
     if (!matches_view_filter(db, *_base, _view_info, base_key, update, now)) {
-        do_delete_old_entry(base_key, existing, update, now, api::missing_timestamp);
+        vlogger.warn("NYH update_entry do_delete_old_entry case", ts);
+        do_delete_old_entry(base_key, existing, update, now, ts);
         return;
     }
 
     if (can_skip_view_updates(update, existing)) {
+        vlogger.warn("NYH update_entry skip case", ts);
         return;
     }
 
+    vlogger.warn("NYH update_entry general case", ts);
     auto view_rows = get_view_rows(base_key, update, std::nullopt, {});
-    auto update_marker = compute_row_marker(update);
+    // NYH: we should get the timestamp from the caller, but I'm not sure if I fixed all the callers so let's allow missing timestamp and call compute_row_marker
+    // NYH TODO: need to get not just ts but also ttl and expiry.... :-( This code probably won't work when there is ttl and expiry (it doesn't happen in Alternator, but still...)
+    auto update_marker = (ts == api::missing_timestamp) ? compute_row_marker(update) : row_marker(ts);
+
     const auto kind = update.column_kind();
     for (const auto& [r, action] : view_rows) {
         if (auto rm = std::get_if<row_marker>(&action)) {
@@ -1284,12 +1295,12 @@ void view_updates::generate_update(
         // The view key is necessarily the same pre and post update.
         if (existing && existing->is_live(*_base)) {
             if (update.is_live(*_base)) {
-                update_entry(db, base_key, update, *existing, now);
+                update_entry(db, base_key, update, *existing, now, api::missing_timestamp);
             } else {
                 delete_old_entry(db, base_key, *existing, update, now, api::missing_timestamp);
             }
         } else if (update.is_live(*_base)) {
-            create_entry(db, base_key, update, now);
+            create_entry(db, base_key, update, now, api::missing_timestamp);
         }
         return;
     }
@@ -1369,6 +1380,32 @@ void view_updates::generate_update(
         }
     }
     vlogger.warn("NYH generate_update has_old_row={}, has_new_row={}, same_row={}", has_old_row, has_new_row, same_row);
+
+    // Calculate new_row_ts, only if has_new_row. This is the logic that used
+    // to be in compute_row_marker() and is no longer used.
+    api::timestamp_type new_row_ts; // only set if has_new_row
+    if (has_new_row) {
+        // Note:
+        // 1. By reaching here we know that updatable_view_key_cols has at
+        //    least one member (in CQL, it's always one, in Alternator it
+        //    may be two).
+        // 2. Because has_new_row, we know all elements in that array have
+        //    after.has_value() true, so we can use after.get_ts().
+        new_row_ts = updatable_view_key_cols[0].after.get_ts();
+        if (updatable_view_key_cols.size() > 1) {
+            // This is the Alternator-only support for two regular base
+            // columns that become view key columns. See explanation in
+            // view_updates::compute_row_marker().
+            auto second_ts = updatable_view_key_cols[1].after.get_ts();
+            new_row_ts = std::max(new_row_ts, second_ts);
+            // Alternator isn't supposed to have more than two updatable view key columns!
+            if (updatable_view_key_cols.size() != 2) [[unlikely]] {
+                utils::on_internal_error(format("Unexpected updatable_view_key_col length {}", updatable_view_key_cols.size()));
+            }
+        }
+        vlogger.warn("NYH generate_update new_row_ts = {}", new_row_ts);
+    }
+
     if (has_old_row) {
         // We should pass updateable_view_key_cols to the delete_old_entry()
         // and the rest of the functions below so they won't need to calculate
@@ -1388,6 +1425,8 @@ void view_updates::generate_update(
         // 2. Because has_old_row, we know all elements in that array have
         //    before.has_value() true, so we can use before.get_ts().
         auto old_row_ts = updatable_view_key_cols[0].before.get_ts();
+        // NYH TRY...
+        //old_row_ts+=10000000; // THIS HELPS test_update_gsi_pk past line 400, WHY? NYH CONTINUE HERE!!!
         if (updatable_view_key_cols.size() > 1) {
             // This is the Alternator-only support for two regular base
             // columns that become view key columns. See explanation in
@@ -1399,9 +1438,11 @@ void view_updates::generate_update(
                 utils::on_internal_error(format("Unexpected updatable_view_key_col length {}", updatable_view_key_cols.size()));
             }
         }
+        vlogger.warn("NYH generate_update old_row_ts = {}", old_row_ts);
         if (has_new_row) {
             if (same_row) {
-                update_entry(db, base_key, update, *existing, now);
+                update_entry(db, base_key, update, *existing, now, new_row_ts);
+                for(auto&x : _updates) { vlogger.warn("NYH generate_update after update_entry, pk={} partition={}", x.first, mutation_partition::printer(*_view, x.second)); }
             } else {
                 // This code doesn't work if the old and new view row have the
                 // same key, because if they do we get both data and tombstone
@@ -1412,14 +1453,16 @@ void view_updates::generate_update(
                 // need to pass the ts.
                 delete_old_entry(db, base_key, *existing, update, now, old_row_ts);
                 for(auto&x : _updates) { vlogger.warn("NYH generate_update delete_old_entry B, pk={} partition={}", x.first, mutation_partition::printer(*_view, x.second)); }
-                create_entry(db, base_key, update, now);
+                create_entry(db, base_key, update, now, new_row_ts);
                 for(auto&x : _updates) { vlogger.warn("NYH generate_update after also create_entry B, pk={} partition={}", x.first, mutation_partition::printer(*_view, x.second)); }
             }
         } else {
             delete_old_entry(db, base_key, *existing, update, now, old_row_ts);
+            for(auto&x : _updates) { vlogger.warn("NYH generate_update after delete_old_entry, pk={} partition={}", x.first, mutation_partition::printer(*_view, x.second)); }
         }
     } else if (has_new_row) {
-        create_entry(db, base_key, update, now);
+        create_entry(db, base_key, update, now, new_row_ts);
+        for(auto&x : _updates) { vlogger.warn("NYH generate_update after create_entry, pk={} partition={}", x.first, mutation_partition::printer(*_view, x.second)); }
     }
 
 }
