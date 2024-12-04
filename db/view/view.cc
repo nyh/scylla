@@ -662,8 +662,8 @@ public:
             return {_update.key()->get_component(_base, base_col->position())};
         default:
             if (base_col->kind != _update.column_kind()) {
-                on_internal_error(vlogger, format("Tried to get a {} column from a {} row update, which is impossible",
-                        to_sstring(base_col->kind), _update.is_clustering_row() ? "clustering" : "static"));
+                on_internal_error(vlogger, format("Tried to get a {} column {} from a {} row update, which is impossible",
+                        to_sstring(base_col->kind), base_col->name_as_text(), _update.is_clustering_row() ? "clustering" : "static"));
             }
             auto& c = _update.cells().cell_at(base_col->id);
             auto value_view = base_col->is_atomic() ? c.as_atomic_cell(cdef).value() : c.as_collection_mutation().data;
@@ -1015,7 +1015,7 @@ void view_updates::delete_old_entry(data_dictionary::database db, const partitio
 }
 
 void view_updates::do_delete_old_entry(const partition_key& base_key, const clustering_or_static_row& existing, const clustering_or_static_row& update, gc_clock::time_point now, api::timestamp_type deletion_ts) {
-    vlogger.warn("NYH do_delete_old_entry");
+    vlogger.warn("NYH do_delete_old_entry {}", existing.is_clustering_row());
     auto view_rows = get_view_rows(base_key, existing, std::nullopt, update.tomb());
     const auto kind = existing.column_kind();
     for (const auto& [r, action] : view_rows) {
@@ -1220,50 +1220,6 @@ void view_updates::update_entry_for_computed_column(
     }
 }
 
-// Extract a view key from a base partition-key and base row (before or after
-// an update). Each view key component may come from either a real base column
-// or from computed columns based on base columns.
-// If any of the view key components is null, this view row should be skipped
-// entirely, so this function returns null.
-// BUT - I think we need to return a add/delete timestamp, no????
-// 
-#if 0
-?? get_view_key
-    vector_type operator()(const column_definition& cdef) {
-        column_position++;
-
-        // Note that in the following lines, if the key column exists in the
-        // base table, then it will be used and the requested computed column
-        // will be outright ignored.
-        // I'm not sure why we chose this surprising logic, but it turns out
-        // to be useful in Alternator when combining an LSI (which puts its
-        // key attribute a real base column) and GSI (which uses a computed
-        // column) - and this logic means the GSI will read the real column
-        // stored by the LSI, which turns out to be the right thing to do
-        // (see the test test_gsi.py::test_gsi_and_lsi_same_key).
-        auto* base_col = _base.get_column_definition(cdef.name());
-        if (!base_col) {
-            return handle_computed_column(cdef);
-        }
-        switch (base_col->kind) {
-        case column_kind::partition_key:
-            return {_base_key.get_component(_base, base_col->position())};
-        case column_kind::clustering_key:
-            if (_update.is_static_row()) {
-                on_internal_error(vlogger, "Tried to get view row value for a static row update in a view with partition key having clustering columns from original table");
-            }
-            return {_update.key()->get_component(_base, base_col->position())};
-        default:
-            if (base_col->kind != _update.column_kind()) {
-                on_internal_error(vlogger, format("Tried to get a {} column from a {} row update, which is impossible",
-                        to_sstring(base_col->kind), _update.is_clustering_row() ? "clustering" : "static"));
-            }
-            auto& c = _update.cells().cell_at(base_col->id);
-            auto value_view = base_col->is_atomic() ? c.as_atomic_cell(cdef).value() : c.as_collection_mutation().data;
-            return {managed_bytes_view{value_view}};
-        }
-#endif
-
 void view_updates::generate_update(
         data_dictionary::database db,
         const partition_key& base_key,
@@ -1335,7 +1291,7 @@ void view_updates::generate_update(
                 } else {
                     // unexpected, we don't have other types of computation
                     // that depend on non-primary key column.
-                    abort();
+                    on_internal_error(vlogger, "unexpected computation type");
                 }
             }
         } else {
@@ -1344,15 +1300,34 @@ void view_updates::generate_update(
                 on_internal_error(vlogger, fmt::format("Column {} in view {}.{} was not found in the base table {}.{}",
                     view_col.name(), _view->ks_name(), _view->cf_name(), _base->ks_name(), _base->cf_name()));
             }
-            // TODO: according to the old code, it seems that if the update is a
-            // regular row we only need to look at the regular columns in the base,
-            // if the update is a static row we only need to check for base static
-            // rows. So if we cache this, we need to cache two verison - like
-            // we had base_regular/static_columns_in_view_pk. But I don't understand why.
+            // If the view key column was also a base primary key column, then
+            // it can't possibly change in this update. But the column was not
+            // not a primary key column - i.e., a regular column or static
+            // column, the update might have changed it and we need to list it
+            // on updatable_view_key_cols:
             if (!base_col->is_primary_key()) {
-                //variable_view_key_cols.push_back(view_col.id);
-                // CONTINUE HERE: non-computed columns
-                abort();
+                // This is view key, so we know it is atomic
+                // TODO: according to the old code, it seems that if the update is a
+                // regular row we only need to look at the regular columns in the base,
+                // if the update is a static row we only need to check for base static
+                // rows. So if we cache this, we need to cache two verison - like
+                // we had base_regular/static_columns_in_view_pk. But I don't understand why.
+                atomic_cell_view after = update.cells().find_cell(base_col->id)->as_atomic_cell(*base_col);
+                std::optional<atomic_cell_view> before;
+                if (existing) {
+                    before = existing->cells().find_cell(base_col->id)->as_atomic_cell(*base_col);
+                }
+                updatable_view_key_cols.emplace_back(view_col.id,
+                    before ? (
+                        before->is_live() ?
+                            regular_column_transformation::result::value(to_bytes(before->value()), before->timestamp()) :
+                            regular_column_transformation::result::deleted_value(before->timestamp())
+                        ) :
+                        regular_column_transformation::result::missing_value(),
+                    after.is_live() ?
+                        regular_column_transformation::result::value(to_bytes(after.value()), after.timestamp()) :
+                        regular_column_transformation::result::deleted_value(after.timestamp())
+                    );
             }
         }
     }
@@ -1383,6 +1358,7 @@ void view_updates::generate_update(
 
     // Calculate new_row_ts, only if has_new_row. This is the logic that used
     // to be in compute_row_marker() and is no longer used.
+    // TODO: may need to also have ttl, not just ts, so perahps have new_row_marker that has both.
     api::timestamp_type new_row_ts; // only set if has_new_row
     if (has_new_row) {
         // Note:
