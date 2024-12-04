@@ -1539,3 +1539,89 @@ def test_alter_table_add_select_star(cql, test_keyspace):
             cql.execute(f'INSERT INTO {base} (p,a,b,c) VALUES (0,1,2,3)')
             assert {(0,1,2,3),(1,2,3,None)} == set(cql.execute(f"SELECT p,a,b,c FROM {base}"))
             assert {(0,1,2,3),(1,2,3,None)} == set(cql.execute(f"SELECT p,a,b,c FROM {mv}"))
+
+# Test that tombstones with future timestamps work correctly
+# when a write with lower timestamp arrives - in such case,
+# if the base row is covered by such a tombstone, a view update
+# needs to take it into account.
+# Reproduces issue #5793
+def test_views_with_future_tombstones(cql, test_keyspace):
+    with new_test_table(cql, test_keyspace, 'a int, b int, c int, d int, e int, primary key (a, b, c)') as table:
+        with new_materialized_view(cql, table, '*', 'b, a, c', 'a is not null and b is not null and c is not null') as mv:
+            # Partition tombstone
+            cql.execute(f'delete from {table} using timestamp 10 where a=1')
+            assert [] == list(cql.execute(f'select * from {table}'))
+            cql.execute(f'insert into {table} (a,b,c,d,e) values (1,2,3,4,5) using timestamp 8')
+            assert [] == list(cql.execute(f'select * from {table}'))
+            # On a single-node test, the update will be synchronous so no
+            # need for retry.
+            assert [] == list(cql.execute(f'select * from {mv}'))
+
+            # Range tombstone
+            cql.execute(f'delete from {table} using timestamp 16 where a=2 and b > 1 and b < 4')
+            assert [] == list(cql.execute(f'select * from {table}'))
+            cql.execute(f'insert into {table} (a,b,c,d,e) values (2,3,4,5,6) using timestamp 12')
+            assert [] == list(cql.execute(f'select * from {table}'))
+            assert [] == list(cql.execute(f'select * from {mv}'))
+
+            # Row tombstone
+            cql.execute(f'delete from {table} using timestamp 24 where a=3 and b=4 and c=5')
+            assert [] == list(cql.execute(f'select * from {table}'))
+            cql.execute(f'insert into {table} (a,b,c,d,e) values (3,4,5,6,7) using timestamp 18')
+            assert [] == list(cql.execute(f'select * from {table}'))
+            assert [] == list(cql.execute(f'select * from {mv}'))
+
+# Reproducer for a hypothetical bug (that didn't exist) #21769. We want to
+# check what happens when some cells in a collection column are newer than
+# a shadowable tombstone that is expected to delete them.
+def test_shadowable_tombstone_and_newer_collection_cells(cql, test_keyspace):
+    with new_test_table(cql, test_keyspace, 'p int, c int, x int, m map<int, int>, primary key (p, c)') as table:
+        with new_materialized_view(cql, table, '*', 'x, p, c', 'x is not null and p is not null and c is not null') as mv:
+            # Insert into the base table a row p=1 c=2 with x=3. This will
+            # create an empty view row x=3
+            cql.execute(f'insert into {table} (p,c,x) values (1,2,3)')
+            # We should see this new row when reading the view partition x=1.
+            # We assume that on a single-node test, the view updates are
+            # synchronous so don't need to retry.
+            assert [(1,2,3)] == list(cql.execute(f'select p,c,x from {mv} where x=3'))
+            # Now, in the base row p=1 c=2 leave x unmodified (3), but add
+            # an element to the map m. The view row will remain with its old
+            # timestamp, but will get a new cell - the new map element - with
+            # a *newer* timestamp.
+            cql.execute(f'update {table} set m = m + {{7: 8}} where p=1 and c=2')
+            assert [(1,2,3,{7:8})] == list(cql.execute(f'select p,c,x,m from {mv} where x=3'))
+            # Finally, in the base row p=1 c=2, set x to 4. This should
+            # create a new view rew with x=5, but more importantly for this
+            # test - should delete the entirety of the old view row x=3.
+            # Even the map item that was added with a later timestamp, should
+            # be gone.
+            cql.execute(f'update {table} set x = 4 where p=1 and c=2')
+            assert [(1,2,4,{7:8})] == list(cql.execute(f'select p,c,x,m from {mv} where x=4'))
+            assert [] == list(cql.execute(f'select p,c,x,m from {mv} where x=3'))
+# Same but with Alternator-like PutItem that creates a tombstone at timestamp
+# t-1 and the data at time t. Does this triggest 21769? Apparently it doesn't
+# either...
+def test_shadowable_tombstone_and_newer_collection_cells2(cql, test_keyspace):
+    with new_test_table(cql, test_keyspace, 'p int, c int, x int, m map<int, int>, primary key (p, c)') as table:
+        with new_materialized_view(cql, table, '*', 'x, p, c', 'x is not null and p is not null and c is not null') as mv:
+            # Insert into the base table a row p=1 c=2 with x=3. This will
+            # create an empty view row x=3
+            cql.execute(f'begin unlogged batch delete from {table} using timestamp 9 where p=1 and c=2 insert into {table} (p,c,x) values (1,2,3) using timestamp 10 apply batch')
+            # We should see this new row when reading the view partition x=1.
+            # We assume that on a single-node test, the view updates are
+            # synchronous so don't need to retry.
+            assert [(1,2,3)] == list(cql.execute(f'select p,c,x from {mv} where x=3'))
+            # Now, in the base row p=1 c=2 leave x unmodified (3), but add
+            # an element to the map m. The view row will remain with its old
+            # timestamp, but will get a new cell - the new map element - with
+            # a *newer* timestamp.
+            cql.execute(f'update {table} using timestamp 20 set m = m + {{7: 8}} where p=1 and c=2')
+            assert [(1,2,3,{7:8})] == list(cql.execute(f'select p,c,x,m from {mv} where x=3'))
+            # Finally, in the base row p=1 c=2, set x to 4. This should
+            # create a new view rew with x=5, but more importantly for this
+            # test - should delete the entirety of the old view row x=3.
+            # Even the map item that was added with a later timestamp, should
+            # be gone.
+            cql.execute(f'update {table} using timestamp 30 set x = 4 where p=1 and c=2')
+            assert [(1,2,4,{7:8})] == list(cql.execute(f'select p,c,x,m from {mv} where x=4'))
+            assert [] == list(cql.execute(f'select p,c,x,m from {mv} where x=3'))
