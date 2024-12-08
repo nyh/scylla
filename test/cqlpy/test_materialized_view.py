@@ -1624,4 +1624,70 @@ def test_shadowable_tombstone_and_newer_collection_cells2(cql, test_keyspace):
             # be gone.
             cql.execute(f'update {table} using timestamp 30 set x = 4 where p=1 and c=2')
             assert [(1,2,4,{7:8})] == list(cql.execute(f'select p,c,x,m from {mv} where x=4'))
-            assert [] == list(cql.execute(f'select p,c,x,m from {mv} where x=3'))
+
+# Same as previous test bug like in Alternator, use INSERT instead of UPDATE
+# for the last update, to also create a new row marker for the row.
+# Now this row marker is new, if we use the logic to decide the shadowable
+# tombstone timestamp in do_delete_old_entry() based on just the key columns
+# it will be old, and older than the row marker. So the shadowable row marker
+# will have no affect, and just individual columns will be hidden, not the
+# entire row!
+# Also no need to mess with map column, can use normal integer
+def test_shadowable_tombstone_and_newer_collection_cells3(cql, test_keyspace):
+    with new_test_table(cql, test_keyspace, 'p int, c int, x int, y int, primary key (p, c)') as table:
+        with new_materialized_view(cql, table, '*', 'x, p, c', 'x is not null and p is not null and c is not null') as mv:
+            # Insert into the base table a row p=1 c=2 with x=3. This will
+            # create an empty view row x=3
+            cql.execute(f'insert into {table} (p,c,x) values (1,2,3)')
+            # We should see this new row when reading the view partition x=1.
+            # We assume that on a single-node test, the view updates are
+            # synchronous so don't need to retry.
+            assert [(1,2,3,None)] == list(cql.execute(f'select p,c,x,y from {mv} where x=3'))
+            # Now, in the base row p=1 c=2 leave x unmodified (3), but set
+            # a value for column y. The new cell y will get a new timestamp,
+            # but because we use INSERT instead of UPDATE - the row marker
+            # will also get a new row timestamp. This last fact is the crux
+            # of this test.
+            cql.execute(f'insert into {table} (p,c,y) values (1,2,7)')
+            assert [(1,2,3,7)] == list(cql.execute(f'select p,c,x,y from {mv} where x=3'))
+            # Finally, in the base row p=1 c=2, set x to 4. This should
+            # create a new view rew with x=5, but more importantly for this
+            # test - should delete the entirety of the old view row x=3.
+            # If the shadowable tombstone isn't created new enough - newer
+            # than the new row marker we added in the previous step - it won't
+            # be able to delete the row.
+            #cql.execute(f'update {table} set x = 4 where p=1 and c=2')
+            cql.execute(f'insert into {table} (p,c,x) values (1,2,4)')
+            assert [(1,2,4,7)] == list(cql.execute(f'select p,c,x,y from {mv} where x=4'))
+            assert [] == list(cql.execute(f'select p,c,x,y from {mv} where x=3'))
+
+# check maybe the reason why the Alternator test had this problem was
+# that the base table had only partitions, no clustering keys?
+def test_shadowable_tombstone_and_newer_collection_cells4(cql, test_keyspace):
+    with new_test_table(cql, test_keyspace, 'p int, x int, y int, primary key (p)') as table:
+        with new_materialized_view(cql, table, '*', 'x, p', 'x is not null and p is not null') as mv:
+            # Insert into the base table a row p=1 with x=2. This will
+            # create an empty view row x=2
+            cql.execute(f'insert into {table} (p,x) values (1,2)')
+            # We should see this new row when reading the view partition x=2.
+            # We assume that on a single-node test, the view updates are
+            # synchronous so don't need to retry.
+            assert [(1,2,None)] == list(cql.execute(f'select p,x,y from {mv} where x=2'))
+            # Now, in the base row p=1 leave x unmodified (2), but set
+            # a value for column y. The new cell y will get a new timestamp,
+            # but even though we use INSERT instead of UPDATE the view
+            # row should not get a new row timestamp. This last fact is the
+            # crux of this test.
+            cql.execute(f'insert into {table} (p,y) values (1,7)')
+            assert [(1,2,7)] == list(cql.execute(f'select p,x,y from {mv} where x=2'))
+            # Finally, in the base row p=1 set x to 3. This should
+            # create a new view rew with x=3, but more importantly for this
+            # test - should delete the entirety of the old view row x=2.
+            # If the shadowable tombstone isn't created new enough - newer
+            # than the new row marker we added in the previous step - it won't
+            # be able to delete the row.
+            #cql.execute(f'update {table} set x = 4 where p=1 and c=2')
+            cql.execute(f'insert into {table} (p,x) values (1,3)')
+            assert [(1,3,7)] == list(cql.execute(f'select p,x,y from {mv}'))
+            assert [(1,3,7)] == list(cql.execute(f'select p,x,y from {mv} where x=3'))
+            assert [] == list(cql.execute(f'select p,x,y from {mv} where x=2'))
