@@ -1421,6 +1421,68 @@ def test_gsi_backfill(dynamodb):
                         'Projection': { 'ProjectionType': 'ALL' }
                     }}])
 
+# Another test similar to the above test_gsi_backfill(), but here we add
+# a GSI to a table that already has an LSI with the same key column, and
+# check that the new GSI works (in Alternator's implementation, the LSI key
+# column will become a real column in the schema, and the GSI needs to use
+# that instead of the usual computed column).
+# Reproduces issue #5022.
+@pytest.mark.xfail(reason="issue #5022")
+def test_gsi_backfill_with_lsi(dynamodb):
+    # First create, and fill, a table with an LSI but without GSI.
+    with new_test_table(dynamodb,
+            KeySchema=[
+                # Must have both hash key and range key to allow LSI creation
+                { 'AttributeName': 'p', 'KeyType': 'HASH' },
+                { 'AttributeName': 'c', 'KeyType': 'RANGE' }
+            ],
+            AttributeDefinitions=[
+                { 'AttributeName': 'p', 'AttributeType': 'S' },
+                { 'AttributeName': 'c', 'AttributeType': 'S' },
+                { 'AttributeName': 'x', 'AttributeType': 'S' },
+            ],
+            LocalSecondaryIndexes=[
+                {   'IndexName': 'lsi',
+                    'KeySchema': [
+                        { 'AttributeName': 'p', 'KeyType': 'HASH' },
+                        { 'AttributeName': 'x', 'KeyType': 'RANGE' },
+                    ],
+                    'Projection': { 'ProjectionType': 'ALL' }
+                }
+            ]) as table:
+        items = [{'p': random_string(), 'c': random_string(), 'x': random_string(), 'y': random_string()} for i in range(10)]
+        with table.batch_writer() as batch:
+            for item in items:
+                batch.put_item(item)
+        assert multiset(items) == multiset(full_scan(table))
+        # Now use UpdateTable to create the GSI
+        dynamodb.meta.client.update_table(TableName=table.name,
+            GlobalSecondaryIndexUpdates=[ {  'Create':
+                {   'IndexName': 'gsi',
+                    'KeySchema': [{ 'AttributeName': 'x', 'KeyType': 'HASH' }],
+                    'Projection': { 'ProjectionType': 'ALL' }
+                }}])
+        # update_table is an asynchronous operation. We need to wait until it
+        # finishes and the table is backfilled.
+        wait_for_gsi(table, 'gsi')
+        # Check that the GSI got backfilled as expected. Note that we don't
+        # need to retry the reads here (i.e., use the assert_index_scan() or
+        # assert_index_query() functions) because after we waited for
+        # backfilling to complete, we know all the pre-existing data is
+        # already in the index.
+        assert multiset(items1) == multiset(full_scan(table, ConsistentRead=False, IndexName='gsi'))
+        # Let's also test that we cannot add a GSI with the same name as an
+        # already existing LSI (see test_lsi.py::test_lsi_and_gsi_same_same
+        # for an explanation why this is so)
+        with pytest.raises(ClientError, match='ValidationException.*already exists'):
+            dynamodb.meta.client.update_table(TableName=table.name,
+                AttributeDefinitions=[{ 'AttributeName': 'y', 'AttributeType': 'S' }],
+                GlobalSecondaryIndexUpdates=[ {  'Create':
+                    {  'IndexName': 'lsi',
+                        'KeySchema': [{ 'AttributeName': 'y', 'KeyType': 'HASH' }],
+                        'Projection': { 'ProjectionType': 'ALL' }
+                    }}])
+
 # Test deleting an existing GSI using UpdateTable
 # Reproduces issue #5022.
 @pytest.mark.xfail(reason="issue #5022")
@@ -1463,6 +1525,66 @@ def test_gsi_delete(dynamodb):
         p = random_string()
         table.put_item(Item={'p': p, 'x': 7})
         assert table.get_item(Key={'p':  p}, ConsistentRead=True)['Item'] == {'p': p, 'x': 7}
+
+# Another test for deleting a GSI using UpdateTable, similar to the previous
+# test test_gsi_delete() but in this test we *also* have an LSI whose range
+# key is the same attribute used by the GSI. It should be legal to delete the
+# GSI, but after the deletion the restriction of the type of the column is
+# still enforced because it is still an LSI key. In Alternator's
+# implementation this happens because the LSI key column was - and remains -
+# a real column in the schema.
+# Reproduces issue #5022.
+@pytest.mark.xfail(reason="issue #5022")
+def test_gsi_delete_with_lsi(dynamodb):
+    # A table whose non-key column "x" serves as a range key in an LSI,
+    # and partition key in a GSI.
+    with new_test_table(dynamodb,
+        KeySchema=[
+            # Must have both hash key and range key to allow LSI creation
+            { 'AttributeName': 'p', 'KeyType': 'HASH' },
+            { 'AttributeName': 'c', 'KeyType': 'RANGE' }
+        ],
+        AttributeDefinitions=[
+            { 'AttributeName': 'p', 'AttributeType': 'S' },
+            { 'AttributeName': 'c', 'AttributeType': 'S' },
+            { 'AttributeName': 'x', 'AttributeType': 'S' },
+        ],
+        LocalSecondaryIndexes=[
+            {   'IndexName': 'lsi',
+                'KeySchema': [
+                    { 'AttributeName': 'p', 'KeyType': 'HASH' },
+                    { 'AttributeName': 'x', 'KeyType': 'RANGE' },
+                ],
+                'Projection': { 'ProjectionType': 'ALL' }
+            }
+        ],
+        GlobalSecondaryIndexes=[
+            {   'IndexName': 'gsi',
+                'KeySchema': [{ 'AttributeName': 'x', 'KeyType': 'HASH' }],
+                'Projection': { 'ProjectionType': 'ALL' }
+            }
+        ]) as table:
+        items = [{'p': random_string(), 'c': random_string(), 'x': random_string()} for i in range(10)]
+        with table.batch_writer() as batch:
+            for item in items:
+                batch.put_item(item)
+        # So far, we have the GSI for "x" and can use it:
+        assert_index_query(table, 'gsi', [items[3]],
+            KeyConditions={'x': {'AttributeValueList': [items[3]['x']], 'ComparisonOperator': 'EQ'}})
+        # Now use UpdateTable to delete the GSI for "x"
+        dynamodb.meta.client.update_table(TableName=table.name,
+            GlobalSecondaryIndexUpdates=[{ 'Delete': { 'IndexName': 'gsi' } }])
+        # update_table is an asynchronous operation. We need to wait until it
+        # finishes and the GSI is removed.
+        wait_for_gsi_gone(table, 'gsi')
+        # Now index is gone. We can no longer query using it.
+        with pytest.raises(ClientError, match='ValidationException.*gsi'):
+            full_query(table, ConsistentRead=False, IndexName='gsi',
+                KeyConditions={'x': {'AttributeValueList': [items[3]['x']], 'ComparisonOperator': 'EQ'}})
+        # The attribute "x" is still a LSI key of type S, so we still aren't
+        # allowed to insert items with a number for x.
+        with pytest.raises(ClientError, match='ValidationException.*mismatch'):
+            table.put_item(Item={'p': random_string(), 'c': random_string(), 'x': 7})
 
 # Utility function for creating a new table a GSI with the given name,
 # and, if creation was successful, delete it. Useful for testing which
