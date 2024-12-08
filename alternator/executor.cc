@@ -1208,66 +1208,9 @@ static future<executor::request_return_type> create_table_on_shard0(service::cli
     // Parse GlobalSecondaryIndexes parameters before creating the base
     // table, so if we have a parse errors we can fail without creating
     // any table.
-    const rjson::value* gsi = rjson::find(request, "GlobalSecondaryIndexes");
     std::vector<schema_builder> view_builders;
     std::unordered_set<std::string> index_names;
-    if (gsi) {
-        if (!gsi->IsArray()) {
-            co_return api_error::validation("GlobalSecondaryIndexes must be an array.");
-        }
-        for (const rjson::value& g : gsi->GetArray()) {
-            const rjson::value* index_name_v = rjson::find(g, "IndexName");
-            if (!index_name_v || !index_name_v->IsString()) {
-                co_return api_error::validation("GlobalSecondaryIndexes IndexName must be a string.");
-            }
-            std::string_view index_name = rjson::to_string_view(*index_name_v);
-            auto [it, added] = index_names.emplace(index_name);
-            if (!added) {
-                co_return api_error::validation(fmt::format("Duplicate IndexName '{}', ", index_name));
-            }
-            std::string vname(view_name(table_name, index_name));
-            elogger.trace("Adding GSI {}", index_name);
-            // FIXME: read and handle "Projection" parameter. This will
-            // require the MV code to copy just parts of the attrs map.
-            schema_builder view_builder(keyspace_name, vname);
-            auto [view_hash_key, view_range_key] = parse_key_schema(g);
-
-            // If an attribute is already a real column in the base table
-            // (i.e., a key attribute), we can use it directly as a view key.
-            // Otherwise, we need to add it as a "computed column", which
-            // extracts and deserializes the attribute from the ":attrs" map.
-            if (partial_schema->get_column_definition(to_bytes(view_hash_key))) {
-                add_column(view_builder, view_hash_key, attribute_definitions, column_kind::partition_key);
-            } else {
-                add_column(view_builder, view_hash_key, attribute_definitions, column_kind::partition_key, true);
-            }
-            unused_attribute_definitions.erase(view_hash_key);
-            if (!view_range_key.empty()) {
-                if (partial_schema->get_column_definition(to_bytes(view_range_key))) {
-                    add_column(view_builder, view_range_key, attribute_definitions, column_kind::clustering_key);
-                } else {
-                    if (!partial_schema->get_column_definition(to_bytes(view_hash_key))) {
-                        // FIXME: This warning should go away. See issue #6714
-                        elogger.warn("Only 1 regular column from the base table should be used in the GSI key in order to ensure correct liveness management without assumptions");
-                    }
-                    add_column(view_builder, view_range_key, attribute_definitions, column_kind::clustering_key, true);
-                }
-                unused_attribute_definitions.erase(view_range_key);
-            }
-            // Base key columns which aren't part of the index's key need to
-            // be added to the view nonetheless, as (additional) clustering
-            // key(s).
-            if  (hash_key != view_hash_key && hash_key != view_range_key) {
-                add_column(view_builder, hash_key, attribute_definitions, column_kind::clustering_key);
-            }
-            if  (!range_key.empty() && range_key != view_hash_key && range_key != view_range_key) {
-                add_column(view_builder, range_key, attribute_definitions, column_kind::clustering_key);
-            }
-            // GSIs have no tags:
-            view_builder.add_extension(db::tags_extension::NAME, ::make_shared<db::tags_extension>());
-            view_builders.emplace_back(std::move(view_builder));
-        }
-    }
+    std::unordered_set<std::string> lsi_range_keys;
 
     const rjson::value* lsi = rjson::find(request, "LocalSecondaryIndexes");
     if (lsi) {
@@ -1325,9 +1268,72 @@ static future<executor::request_return_type> create_table_on_shard0(service::cli
             std::map<sstring, sstring> tags_map = {{db::SYNCHRONOUS_VIEW_UPDATES_TAG_KEY, "true"}};
             view_builder.add_extension(db::tags_extension::NAME, ::make_shared<db::tags_extension>(tags_map));
             view_builders.emplace_back(std::move(view_builder));
+            // Remember the attributes used for LSI keys. Since LSI must be
+            // created with the table, we make these attributes real schema
+            // columns, and need to remember this below if the same attributes
+            // are used as GSI keys.
+            lsi_range_keys.emplace(view_range_key);
         }
     }
 
+    const rjson::value* gsi = rjson::find(request, "GlobalSecondaryIndexes");
+    if (gsi) {
+        if (!gsi->IsArray()) {
+            co_return api_error::validation("GlobalSecondaryIndexes must be an array.");
+        }
+        for (const rjson::value& g : gsi->GetArray()) {
+            const rjson::value* index_name_v = rjson::find(g, "IndexName");
+            if (!index_name_v || !index_name_v->IsString()) {
+                co_return api_error::validation("GlobalSecondaryIndexes IndexName must be a string.");
+            }
+            std::string_view index_name = rjson::to_string_view(*index_name_v);
+            auto [it, added] = index_names.emplace(index_name);
+            if (!added) {
+                co_return api_error::validation(fmt::format("Duplicate IndexName '{}', ", index_name));
+            }
+            std::string vname(view_name(table_name, index_name));
+            elogger.trace("Adding GSI {}", index_name);
+            // FIXME: read and handle "Projection" parameter. This will
+            // require the MV code to copy just parts of the attrs map.
+            schema_builder view_builder(keyspace_name, vname);
+            auto [view_hash_key, view_range_key] = parse_key_schema(g);
+
+            // If an attribute is already a real column in the base table
+            // (i.e., a key attribute) or we already made into a real column
+            // as an LSI key above, we can use it directly as a view key.
+            // Otherwise, we need to add it as a "computed column", which
+            // extracts and deserializes the attribute from the ":attrs" map.
+            bool view_hash_key_real_column =
+                partial_schema->get_column_definition(to_bytes(view_hash_key)) ||
+                lsi_range_keys.contains(view_hash_key);
+            add_column(view_builder, view_hash_key, attribute_definitions, column_kind::partition_key, !view_hash_key_real_column);
+            unused_attribute_definitions.erase(view_hash_key);
+            if (!view_range_key.empty()) {
+                bool view_range_key_real_column =
+                    partial_schema->get_column_definition(to_bytes(view_range_key)) ||
+                    lsi_range_keys.contains(view_range_key);
+                add_column(view_builder, view_range_key, attribute_definitions, column_kind::clustering_key, !view_range_key_real_column);
+                if (!partial_schema->get_column_definition(to_bytes(view_range_key)) &&
+                    !partial_schema->get_column_definition(to_bytes(view_hash_key))) {
+                    // FIXME: This warning should go away. See issue #6714
+                    elogger.warn("Only 1 regular column from the base table should be used in the GSI key in order to ensure correct liveness management without assumptions");
+                }
+                unused_attribute_definitions.erase(view_range_key);
+            }
+            // Base key columns which aren't part of the index's key need to
+            // be added to the view nonetheless, as (additional) clustering
+            // key(s).
+            if  (hash_key != view_hash_key && hash_key != view_range_key) {
+                add_column(view_builder, hash_key, attribute_definitions, column_kind::clustering_key);
+            }
+            if  (!range_key.empty() && range_key != view_hash_key && range_key != view_range_key) {
+                add_column(view_builder, range_key, attribute_definitions, column_kind::clustering_key);
+            }
+            // GSIs have no tags:
+            view_builder.add_extension(db::tags_extension::NAME, ::make_shared<db::tags_extension>());
+            view_builders.emplace_back(std::move(view_builder));
+        }
+    }
     if (!unused_attribute_definitions.empty()) {
         co_return api_error::validation(fmt::format(
             "AttributeDefinitions defines spurious attributes not used by any KeySchema: {}",
