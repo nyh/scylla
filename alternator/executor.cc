@@ -216,7 +216,7 @@ static void validate_table_name(const std::string& name) {
 // instead of each component individually as DynamoDB does.
 // The view_name() function assumes the table_name has already been validated
 // but validates the legality of index_name and the combination of both.
-static std::string view_name(const std::string& table_name, std::string_view index_name, const std::string& delim = ":") {
+static std::string view_name(std::string_view table_name, std::string_view index_name, const std::string& delim = ":") {
     if (index_name.length() < 3) {
         throw api_error::validation("IndexName must be at least 3 characters long");
     }
@@ -224,7 +224,7 @@ static std::string view_name(const std::string& table_name, std::string_view ind
         throw api_error::validation(
                 fmt::format("IndexName '{}' must satisfy regular expression pattern: [a-zA-Z0-9_.-]+", index_name));
     }
-    std::string ret = table_name + delim + std::string(index_name);
+    std::string ret = std::string(table_name) + delim + std::string(index_name);
     if (ret.length() > max_table_name_length) {
         throw api_error::validation(
                 fmt::format("The total length of TableName ('{}') and IndexName ('{}') cannot exceed {} characters",
@@ -1528,6 +1528,9 @@ future<executor::request_return_type> executor::update_table(client_state& clien
             }
         }
 
+        auto schema = builder.build();
+        std::vector<view_ptr> new_views;
+
         rjson::value* gsi_updates = rjson::find(request, "GlobalSecondaryIndexUpdates");
         if (gsi_updates) {
             if (!gsi_updates->IsArray()) {
@@ -1550,7 +1553,73 @@ future<executor::request_return_type> executor::update_table(client_state& clien
                 auto it = (*gsi_updates)[0].MemberBegin();
                 const std::string_view op = rjson::to_string_view(it->name);
                 if (op == "Create") {
-                    co_return api_error::validation("GlobalSecondaryIndexUpdates Create not yet supported");
+                    if (!it->value.IsObject()) {
+                        co_return api_error::validation("GlobalSecondaryIndexUpdates Create value must be an object");
+                    }
+                    const rjson::value* index_name_v = rjson::find(it->value, "IndexName");
+                    if (!index_name_v || !index_name_v->IsString()) {
+                        co_return api_error::validation("GlobalSecondaryIndexUpdates IndexName must be a string.");
+                    }
+                    // TODO: print better message if missing
+                    const rjson::value& attribute_definitions = request["AttributeDefinitions"];
+                    std::string_view index_name = rjson::to_string_view(*index_name_v);
+                    std::string_view table_name = schema->cf_name();
+                    std::string_view keyspace_name = schema->ks_name();
+                    // TODO: validate the index name doesn't already exist as a GSI or LSI in this
+                    // table!
+                    //auto [it, added] = index_names.emplace(index_name);
+                    //if (!added) {
+                    //    co_return api_error::validation(fmt::format("Duplicate IndexName '{}', ", index_name));
+                    //}
+                    std::string vname(view_name(table_name, index_name));
+                    elogger.trace("Adding GSI {}", index_name);
+                    // FIXME: read and handle "Projection" parameter. This will
+                    // require the MV code to copy just parts of the attrs map.
+                    schema_builder view_builder(keyspace_name, vname);
+                    auto [view_hash_key, view_range_key] = parse_key_schema(it->value);
+                    // If an attribute is already a real column in the base
+                    // table (i.e., a key attribute in the base table or LSI),
+                    // we can use it directly as a view key. Otherwise, we
+                    // need to add it as a "computed column", which extracts
+                    // and deserializes the attribute from the ":attrs" map.
+                    bool view_hash_key_real_column =
+                        schema->get_column_definition(to_bytes(view_hash_key));
+                    add_column(view_builder, view_hash_key, attribute_definitions, column_kind::partition_key, !view_hash_key_real_column);
+                    // TODO: validate attribute definitions
+                    //unused_attribute_definitions.erase(view_hash_key);
+                    if (!view_range_key.empty()) {
+                        bool view_range_key_real_column =
+                            schema->get_column_definition(to_bytes(view_range_key));
+                        add_column(view_builder, view_range_key, attribute_definitions, column_kind::clustering_key, !view_range_key_real_column);
+                        if (!schema->get_column_definition(to_bytes(view_range_key)) &&
+                            !schema->get_column_definition(to_bytes(view_hash_key))) {
+                            // FIXME: This warning should go away. See issue #6714
+                            elogger.warn("Only 1 regular column from the base table should be used in the GSI key in order to ensure correct liveness management without assumptions");
+                        }
+                        // TODO: validate attributed definitions
+                        //unused_attribute_definitions.erase(view_range_key);
+                    }
+                    // Base key columns which aren't part of the index's key need to
+                    // be added to the view nonetheless, as (additional) clustering
+                    // key(s).
+                    for (auto& def : schema->primary_key_columns()) {
+                        if  (def.name_as_text() != view_hash_key && def.name_as_text() != view_range_key) {
+                            view_builder.with_column(def.name(), def.type, def.kind);
+                        }
+                    }
+                    // GSIs have no tags:
+                    view_builder.add_extension(db::tags_extension::NAME, ::make_shared<db::tags_extension>());
+                    // Note below we don't need to add virtual columns, as all
+                    // base columns were copied to view. TODO: reconsider the need
+                    // for virtual columns when we support Projection.
+                    for (const column_definition& regular_cdef : schema->regular_columns()) {
+                        if (!view_builder.has_column(*cql3::to_identifier(regular_cdef))) {
+                            view_builder.with_column(regular_cdef.name(), regular_cdef.type, column_kind::regular_column);
+                        }
+                    }
+                    const bool include_all_columns = true;
+                    view_builder.with_view_info(*schema, include_all_columns, ""/*where clause*/);
+                    new_views.emplace_back(view_builder.build());
                 } else if (op == "Delete") {
                     co_return api_error::validation("GlobalSecondaryIndexUpdates Delete not yet supported");
                 } else if (op == "Update") {
@@ -1559,22 +1628,18 @@ future<executor::request_return_type> executor::update_table(client_state& clien
                     co_return api_error::validation(fmt::format("GlobalSecondaryIndexUpdates supports a Create, Delete or Update operation, saw '{}'", op));
                 }
             }
-
-            // NYH: Continue here: support GlobalSecondaryIndexUpdates: so test_gsi_backfill and other pass
-            // 3. Copy the GSI-creation code from create_table. Perhaps move things to functions to avoid duplication.
-            // 4. Support IndexStatus,Backfilling - so wait_for_gsi() will work in the tests.
-            // 5. Also support GSI deletion.
-            // 6. Don't forget to error on features we don't support yet - and write tests on
-            //    how they work (see TODOs in test_gsi.py).
         }
 
         if (empty_request) {
             co_return api_error::validation("UpdateTable requires one of GlobalSecondaryIndexUpdates, StreamSpecification or BillingMode to be specified");
         }
 
-        auto schema = builder.build();
         co_await verify_permission(enforce_authorization, client_state_other_shard.get(), schema, auth::permission::ALTER);
-        auto m = co_await service::prepare_column_family_update_announcement(p.local(), schema,  std::vector<view_ptr>(), group0_guard.write_timestamp());
+        auto m = co_await service::prepare_column_family_update_announcement(p.local(), schema, std::vector<view_ptr>(), group0_guard.write_timestamp());
+        for (view_ptr view : new_views) {
+            auto m2 = co_await service::prepare_new_view_announcement(p.local(), view, group0_guard.write_timestamp());
+            std::move(m2.begin(), m2.end(), std::back_inserter(m));
+        }
 
         co_await mm.announce(std::move(m), std::move(group0_guard), format("alternator-executor: update {} table", tab->cf_name()));
 
