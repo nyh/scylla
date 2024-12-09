@@ -2,8 +2,9 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-# Tests of for UpdateTable support GSIs (Global Secondary Indexes) - the
-# ability to add a GSI to an existing table, removing a GSI from a table,
+# Tests of for UpdateTable support for the GlobalSecondaryIndexUpdates
+# option for modifying the GSIs (Global Secondary Indexes) on an existing
+# table - adding a GSI to an existing table, removing a GSI from a table,
 # and updating an existing GSI.
 # This feature was issue #11567, so all tests in this file reproduce
 # various cases of that issue.
@@ -11,7 +12,8 @@
 import pytest
 import time
 from botocore.exceptions import ClientError
-from .util import random_string, full_scan, full_query, multiset, new_test_table
+from .util import random_string, full_scan, full_query, multiset, \
+    new_test_table
 
 # update_table() for creating a GSI is an asynchronous operation.
 # The table's TableStatus changes from ACTIVE to UPDATING for a short while
@@ -396,3 +398,114 @@ def test_gsi_key_type_conflict_on_update(dynamodb):
                         'KeySchema': [{ 'AttributeName': 'xyz', 'KeyType': 'HASH' }],
                         'Projection': { 'ProjectionType': 'ALL' }
                     }}])
+
+@pytest.fixture(scope="module")
+def table1(dynamodb):
+    with new_test_table(dynamodb,
+            KeySchema=[
+                { 'AttributeName': 'p', 'KeyType': 'HASH' }],
+            AttributeDefinitions=[
+                { 'AttributeName': 'p', 'AttributeType': 'S' },
+            ]) as table:
+        yield table
+
+# An empty update_table() call, without any parameters changed, is not allowed.
+def test_updatetable_empty(dynamodb, table1):
+    with pytest.raises(ClientError, match='ValidationException.*UpdateTable'):
+        dynamodb.meta.client.update_table(TableName=table1.name)
+    # An empty GlobalSecondaryIndexUpdates array is the same as no parameter
+    # at all:
+    with pytest.raises(ClientError, match='ValidationException.*UpdateTable'):
+        dynamodb.meta.client.update_table(TableName=table1.name,
+            GlobalSecondaryIndexUpdates=[])
+
+# Test various invalid cases of UpdateTable's GlobalSecondaryIndexUpdates.
+def test_gsi_updatetable_errors(dynamodb, table1):
+    client = dynamodb.meta.client
+
+    # Each operation in the GlobalSecondaryIndexUpdates array must contain
+    # some operation - Create, Update, or Delete. It can't be an empty map.
+    with pytest.raises(ClientError, match='ValidationException.*GlobalSecondaryIndexUpdate'):
+        dynamodb.meta.client.update_table(TableName=table1.name,
+            GlobalSecondaryIndexUpdates=[{}])
+
+    # Allowed operations in GlobalSecondaryIndexUpdates are Create, Update
+    # and Delete. An unsupported operation like "Dog" should result in a
+    # validation error.
+
+    # Unfortunately, botocore through a its service description file
+    # botocore/data/dynamodb/2012-08-10/service-2.json knows which
+    # operations are valid and fails to serialize the parameter to "Dog"
+    # so let's monkey-patch botocore's internal service model to allow
+    # the "Dog" to behave like "Create", and let the server reject this
+    # invalid operation.
+    service_model = client.meta.service_model
+    client.meta.service_model._instance_cache = {} # clear cached shapes
+    shape_resolver = service_model._shape_resolver
+    shape = shape_resolver._shape_map['GlobalSecondaryIndexUpdate']
+    shape['members']['Dog'] = shape['members']['Create']
+
+    with pytest.raises(ClientError, match='ValidationException.*GlobalSecondaryIndexUpdate'):
+        client.update_table(TableName=table1.name,
+            AttributeDefinitions=[{ 'AttributeName': 'x', 'AttributeType': 'N' }],
+            GlobalSecondaryIndexUpdates=[ {  'Dog':
+            {  'IndexName': 'ind',
+                'KeySchema': [{ 'AttributeName': 'x', 'KeyType': 'HASH' }],
+                'Projection': { 'ProjectionType': 'ALL' }
+            }}])
+
+    # A single map in the GlobalSecondaryIndexUpdates array can't have both
+    # Create and Delete entries, for example:
+    with pytest.raises(ClientError, match='ValidationException.*one'):
+        client.update_table(TableName=table1.name,
+            AttributeDefinitions=[{ 'AttributeName': 'x', 'AttributeType': 'N' }],
+            GlobalSecondaryIndexUpdates=[
+                {  'Create': {  'IndexName': 'ind',
+                                'KeySchema': [{ 'AttributeName': 'x', 'KeyType': 'HASH' }],
+                                'Projection': { 'ProjectionType': 'ALL' } },
+                   'Delete': {  'IndexName': 'xyz' }
+                }])
+
+    # GlobalSecondaryIndexUpdates can also have more than one seaprate map
+    # in the array, each supposedly indicating a different operation, but
+    # creating more than one GSI in the same UpdateTable is NOT allowed.
+    # DynamoDB throws a LimitExceededException:
+    with pytest.raises(ClientError, match='LimitExceededException'):
+        client.update_table(TableName=table1.name,
+            AttributeDefinitions=[{ 'AttributeName': 'x', 'AttributeType': 'N' }],
+            GlobalSecondaryIndexUpdates=[
+                {  'Create': {  'IndexName': 'ind1',
+                                'KeySchema': [{ 'AttributeName': 'x', 'KeyType': 'HASH' }],
+                                'Projection': { 'ProjectionType': 'ALL' } }
+                },
+                {  'Create': {  'IndexName': 'ind2',
+                                'KeySchema': [{ 'AttributeName': 'x', 'KeyType': 'HASH' }],
+                            'Projection': { 'ProjectionType': 'ALL' } }
+                },
+            ])
+
+    # Similarly, can't delete two GSIs in one UpdateTable operation:
+    with pytest.raises(ClientError, match='LimitExceededException'):
+        client.update_table(TableName=table1.name,
+            AttributeDefinitions=[{ 'AttributeName': 'x', 'AttributeType': 'N' }],
+            GlobalSecondaryIndexUpdates=[
+                { 'Delete': {  'IndexName': 'ind1' } },
+                { 'Delete': {  'IndexName': 'ind2' } }
+            ])
+
+    # Similarly, can't delete a GSI and create another one:
+    with pytest.raises(ClientError, match='LimitExceededException'):
+        client.update_table(TableName=table1.name,
+            AttributeDefinitions=[{ 'AttributeName': 'x', 'AttributeType': 'N' }],
+            GlobalSecondaryIndexUpdates=[
+                {  'Create': {  'IndexName': 'ind1',
+                                'KeySchema': [{ 'AttributeName': 'x', 'KeyType': 'HASH' }],
+                                'Projection': { 'ProjectionType': 'ALL' } }
+                },
+                { 'Delete': {  'IndexName': 'ind2' } }
+            ])
+
+
+# TODO: test GlobalSecondaryIndexUpdates "Update" operation.
+# TODO: test we can delete a GSI that was previously added (our current
+# test deletes a GSI that was created with the table)

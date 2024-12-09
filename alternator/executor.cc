@@ -1479,7 +1479,6 @@ future<executor::request_return_type> executor::update_table(client_state& clien
     elogger.trace("Updating table {}", request);
 
     static const std::vector<sstring> unsupported = {
-        "GlobalSecondaryIndexUpdates", 
         "ProvisionedThroughput",
         "ReplicaUpdates",
         "SSESpecification", 
@@ -1491,11 +1490,14 @@ future<executor::request_return_type> executor::update_table(client_state& clien
         }
     }
 
+    bool empty_request = true;
+
     if (rjson::find(request, "BillingMode")) {
+        empty_request = false;
         verify_billing_mode(request);
     }
 
-    co_return co_await _mm.container().invoke_on(0, [&p = _proxy.container(), request = std::move(request), gt = tracing::global_trace_state_ptr(std::move(trace_state)), enforce_authorization = bool(_enforce_authorization), client_state_other_shard = client_state.move_to_other_shard()]
+    co_return co_await _mm.container().invoke_on(0, [&p = _proxy.container(), request = std::move(request), gt = tracing::global_trace_state_ptr(std::move(trace_state)), enforce_authorization = bool(_enforce_authorization), client_state_other_shard = client_state.move_to_other_shard(), empty_request]
                                                 (service::migration_manager& mm) mutable -> future<executor::request_return_type> {
         // FIXME: the following needs to be in a loop. If mm.announce() below
         // fails, we need to retry the whole thing.
@@ -1515,6 +1517,7 @@ future<executor::request_return_type> executor::update_table(client_state& clien
 
         rjson::value* stream_specification = rjson::find(request, "StreamSpecification");
         if (stream_specification && stream_specification->IsObject()) {
+            empty_request = false;
             add_stream_options(*stream_specification, builder, p.local());
             // Alternator Streams doesn't yet work when the table uses tablets (#16317)
             auto stream_enabled = rjson::find(*stream_specification, "StreamEnabled");
@@ -1523,6 +1526,50 @@ future<executor::request_return_type> executor::update_table(client_state& clien
                 co_return api_error::validation("Streams not yet supported on a table using tablets (issue #16317). "
                     "If you want to enable streams, re-create this table with vnodes (with the tag 'experimental:initial_tablets' set to 'none').");
             }
+        }
+
+        rjson::value* gsi_updates = rjson::find(request, "GlobalSecondaryIndexUpdates");
+        if (gsi_updates) {
+            if (!gsi_updates->IsArray()) {
+                co_return api_error::validation("GlobalSecondaryIndexUpdates must be an array");
+            }
+            if (gsi_updates->Size() > 1) {
+                // Although UpdateTable takes an array of operations could
+                // support multiple Create and/or Delete operations in one
+                // command, DynamoDB doesn't actually allows this, and throws
+                // a LimitExceededException if this is attempted.
+                // TODO: consider diverging from DynamoDB here, and allowing
+                // more than one operation.
+                co_return api_error::limit_exceeded("GlobalSecondaryIndexUpdates only allows one index creation or deletion");
+            }
+            if (gsi_updates->Size() == 1) {
+                empty_request = false;
+                if (!(*gsi_updates)[0].IsObject() || (*gsi_updates)[0].MemberCount() != 1) {
+                    co_return api_error::validation("GlobalSecondaryIndexUpdates array must contain one object with a Create, Delete or Update operation");
+                }
+                auto it = (*gsi_updates)[0].MemberBegin();
+                const std::string_view op = rjson::to_string_view(it->name);
+                if (op == "Create") {
+                    co_return api_error::validation("GlobalSecondaryIndexUpdates Create not yet supported");
+                } else if (op == "Delete") {
+                    co_return api_error::validation("GlobalSecondaryIndexUpdates Delete not yet supported");
+                } else if (op == "Update") {
+                    co_return api_error::validation("GlobalSecondaryIndexUpdates Update not yet supported");
+                } else {
+                    co_return api_error::validation(fmt::format("GlobalSecondaryIndexUpdates supports a Create, Delete or Update operation, saw '{}'", op));
+                }
+            }
+
+            // NYH: Continue here: support GlobalSecondaryIndexUpdates: so test_gsi_backfill and other pass
+            // 3. Copy the GSI-creation code from create_table. Perhaps move things to functions to avoid duplication.
+            // 4. Support IndexStatus,Backfilling - so wait_for_gsi() will work in the tests.
+            // 5. Also support GSI deletion.
+            // 6. Don't forget to error on features we don't support yet - and write tests on
+            //    how they work (see TODOs in test_gsi.py).
+        }
+
+        if (empty_request) {
+            co_return api_error::validation("UpdateTable requires one of GlobalSecondaryIndexUpdates, StreamSpecification or BillingMode to be specified");
         }
 
         auto schema = builder.build();
