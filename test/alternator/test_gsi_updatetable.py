@@ -14,6 +14,7 @@ import time
 from botocore.exceptions import ClientError
 from .util import random_string, full_scan, full_query, multiset, \
     new_test_table
+from .test_gsi import assert_index_query
 
 # update_table() for creating a GSI is an asynchronous operation.
 # The table's TableStatus changes from ACTIVE to UPDATING for a short while
@@ -318,6 +319,7 @@ def test_gsi_delete_with_lsi(dynamodb):
 # skipped while filling the GSI - even if Scylla actually capable of
 # representing such empty view keys (see issue #9375).
 # Reproduces issue #9424.
+@pytest.mark.xfail(reason="issue #9424")
 def test_gsi_backfill_empty_string(dynamodb):
     # First create, and fill, a table without GSI:
     with new_test_table(dynamodb,
@@ -338,8 +340,7 @@ def test_gsi_backfill_empty_string(dynamodb):
         # UpdateTable command to just one, so we need to do it in two separate
         # commands and wait for each to complete.
         dynamodb.meta.client.update_table(TableName=table.name,
-            AttributeDefinitions=[{ 'AttributeName': 'x', 'AttributeType': 'S' },
-                                  { 'AttributeName': 'c', 'AttributeType': 'S' }],
+            AttributeDefinitions=[{ 'AttributeName': 'x', 'AttributeType': 'S' }],
             GlobalSecondaryIndexUpdates=[
                 { 'Create': { 'IndexName': 'index1',
                               'KeySchema': [{ 'AttributeName': 'x', 'KeyType': 'HASH' }],
@@ -532,7 +533,8 @@ def test_gsi_updatetable_spurious_attribute_definitions(table1, scylla_only):
         wait_for_gsi(table1, 'gsi2')
 
 
-# TODO: test GlobalSecondaryIndexUpdates "Update" operation.
+# TODO: test GlobalSecondaryIndexUpdates "Update" operation for setting
+# ProvisionedThrougput (that DescribeTable should retried).
 # TODO: test we can delete a GSI that was previously added (our current
 # test deletes a GSI that was created with the table)
 # TODO: test adding GSI with a name that already exists as GSI/LSI for this table.
