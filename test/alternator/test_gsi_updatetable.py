@@ -75,7 +75,6 @@ def wait_for_gsi_gone(table, gsi_name):
 # the wrong type are silently ignored and not added to the index (it would
 # not have been possible to add such items if the GSI was already configured
 # when they were added).
-@pytest.mark.xfail(reason="issue #11567")
 def test_gsi_backfill(dynamodb):
     # First create, and fill, a table without GSI. The items in items1
     # will have the appropriate string type for 'x' and will later get
@@ -143,7 +142,6 @@ def test_gsi_backfill(dynamodb):
 # check that the new GSI works. In Alternator's implementation, the LSI key
 # column will become a real column in the schema, and the GSI needs to use
 # that instead of the usual computed column.
-@pytest.mark.xfail(reason="issue #11567")
 def test_gsi_backfill_with_lsi(dynamodb):
     # First create, and fill, a table with an LSI but without GSI.
     with new_test_table(dynamodb,
@@ -173,6 +171,7 @@ def test_gsi_backfill_with_lsi(dynamodb):
         assert multiset(items) == multiset(full_scan(table))
         # Now use UpdateTable to create the GSI
         dynamodb.meta.client.update_table(TableName=table.name,
+            AttributeDefinitions=[{ 'AttributeName': 'x', 'AttributeType': 'S' }],
             GlobalSecondaryIndexUpdates=[ {  'Create':
                 {   'IndexName': 'gsi',
                     'KeySchema': [{ 'AttributeName': 'x', 'KeyType': 'HASH' }],
@@ -186,7 +185,7 @@ def test_gsi_backfill_with_lsi(dynamodb):
         # assert_index_query() functions) because after we waited for
         # backfilling to complete, we know all the pre-existing data is
         # already in the index.
-        assert multiset(items1) == multiset(full_scan(table, ConsistentRead=False, IndexName='gsi'))
+        assert multiset(items) == multiset(full_scan(table, ConsistentRead=False, IndexName='gsi'))
         # Let's also test that we cannot add a GSI with the same name as an
         # already existing LSI (see test_lsi.py::test_lsi_and_gsi_same_same
         # for an explanation why this is so)
@@ -200,7 +199,6 @@ def test_gsi_backfill_with_lsi(dynamodb):
                     }}])
 
 # Test deleting an existing GSI using UpdateTable
-@pytest.mark.xfail(reason="issue #11567")
 def test_gsi_delete(dynamodb):
     with new_test_table(dynamodb,
         KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' } ],
@@ -248,7 +246,6 @@ def test_gsi_delete(dynamodb):
 # still enforced because it is still an LSI key. In Alternator's
 # implementation this happens because the LSI key column was - and remains -
 # a real column in the schema.
-@pytest.mark.xfail(reason="issue #11567")
 def test_gsi_delete_with_lsi(dynamodb):
     # A table whose non-key column "x" serves as a range key in an LSI,
     # and partition key in a GSI.
@@ -309,7 +306,6 @@ def test_gsi_delete_with_lsi(dynamodb):
 # skipped while filling the GSI - even if Scylla actually capable of
 # representing such empty view keys (see issue #9375).
 # Reproduces issue #9424.
-@pytest.mark.xfail(reason="issue #11567, #9424")
 def test_gsi_backfill_empty_string(dynamodb):
     # First create, and fill, a table without GSI:
     with new_test_table(dynamodb,
@@ -367,7 +363,6 @@ def test_gsi_backfill_empty_string(dynamodb):
 # happens during the table creation, and one here where the second GSI is
 # added after the table already exists with the first GSI.
 # Reproduces #13870.
-@pytest.mark.xfail(reason="issue #11567")
 def test_gsi_key_type_conflict_on_update(dynamodb):
     with new_test_table(dynamodb,
         KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' }],
@@ -504,10 +499,15 @@ def test_gsi_updatetable_errors(dynamodb, table1):
             ])
 
 
-# TODO: validate AttributeDefinitions unused items, etc.
+# TODO: validate AttributeDefinitions unused (spurious) items, etc.
 # TODO: test GlobalSecondaryIndexUpdates "Update" operation.
 # TODO: test we can delete a GSI that was previously added (our current
 # test deletes a GSI that was created with the table)
 # TODO: test adding GSI with a name that already exists as GSI/LSI for this table.
 # TODO: check UpdateTable permissions to create a GSI. Probably requires permissions both to update existing table and to create new table.
 # TODO: also check autogrant on the new view and autodelete on deleted view!
+# TODO: when UpdateTable creates a GSI the different columns are created in separate code so we need to check the result actually works and has all the columns. Write a test that also has an LSI (which forces some other column to become a real column) and also write additional cells to :attrs, and see all of this is writable/readable with the new GSI.
+# TODO: check ability to add GSI, delete it and then re-add with same name.
+# TODO: check ability to add GSI, then add a second GSI.
+# TODO: check if we have a test where one of GSI keys is already a
+#       key of a the base table or an LSI or GSI.
