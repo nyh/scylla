@@ -1649,7 +1649,7 @@ future<executor::request_return_type> executor::update_table(client_state& clien
                     // key(s).
                     for (auto& def : schema->primary_key_columns()) {
                         if  (def.name_as_text() != view_hash_key && def.name_as_text() != view_range_key) {
-                            view_builder.with_column(def.name(), def.type, def.kind);
+                            view_builder.with_column(def.name(), def.type, column_kind::clustering_key);
                         }
                     }
                     // GSIs have no tags:
