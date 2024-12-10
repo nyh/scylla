@@ -197,6 +197,18 @@ def test_gsi_backfill_with_lsi(dynamodb):
                         'KeySchema': [{ 'AttributeName': 'y', 'KeyType': 'HASH' }],
                         'Projection': { 'ProjectionType': 'ALL' }
                     }}])
+        # When we created the GSI above we had to specify in
+        # AttributeDefinitons the type of "x", even though DynamoDB already
+        # knows it (because it's a base key column). Let's verify we
+        # aren't allowed to skip this AttributeDefinitions, even if it's
+        # redundant:
+        with pytest.raises(ClientError, match='ValidationException.*AttributeDefinitions'):
+            dynamodb.meta.client.update_table(TableName=table.name,
+                GlobalSecondaryIndexUpdates=[ {  'Create':
+                    {   'IndexName': 'gsi2',
+                        'KeySchema': [{ 'AttributeName': 'x', 'KeyType': 'HASH' }],
+                        'Projection': { 'ProjectionType': 'ALL' }
+                    }}])
 
 # Test deleting an existing GSI using UpdateTable
 def test_gsi_delete(dynamodb):
@@ -498,8 +510,28 @@ def test_gsi_updatetable_errors(dynamodb, table1):
                 { 'Delete': {  'IndexName': 'ind2' } }
             ])
 
+# Whereas CreateTable rejects spurious entries in AttributeDefinitions
+# (entries which aren't used as a key of the table or any GSI or LSI),
+# as tested in test_table.py::test_create_table_spurious_attribute_definitions
+# it turns out that in UpdateTable when creating a GSI, spurious attribute
+# definitions are *not* detected in DynamoDB, and silently ignored.
+# In Alternator, we decided to detect this case anyway - it can help users
+# notice problems (see #19784).
+def test_gsi_updatetable_spurious_attribute_definitions(table1, scylla_only):
+    with pytest.raises(ClientError, match='ValidationException.*AttributeDefinitions'):
+        table1.meta.client.update_table(TableName=table1.name,
+            AttributeDefinitions=[
+                { 'AttributeName': 'x', 'AttributeType': 'S' },
+                { 'AttributeName': 'y', 'AttributeType': 'S' }],
+            GlobalSecondaryIndexUpdates=[ {  'Create':
+                {   'IndexName': 'gsi2',
+                    'KeySchema': [{ 'AttributeName': 'x', 'KeyType': 'HASH' }],
+                    'Projection': { 'ProjectionType': 'ALL' }
+                }}])
+        # Just in case the update_table didn't fail as expected...
+        wait_for_gsi(table1, 'gsi2')
 
-# TODO: validate AttributeDefinitions unused (spurious) items, etc.
+
 # TODO: test GlobalSecondaryIndexUpdates "Update" operation.
 # TODO: test we can delete a GSI that was previously added (our current
 # test deletes a GSI that was created with the table)
