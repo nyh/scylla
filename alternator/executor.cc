@@ -1601,6 +1601,7 @@ future<executor::request_return_type> executor::update_table(client_state& clien
 
         auto schema = builder.build();
         std::vector<view_ptr> new_views;
+        std::vector<std::string> dropped_views;
 
         rjson::value* gsi_updates = rjson::find(request, "GlobalSecondaryIndexUpdates");
         if (gsi_updates) {
@@ -1623,14 +1624,18 @@ future<executor::request_return_type> executor::update_table(client_state& clien
                 }
                 auto it = (*gsi_updates)[0].MemberBegin();
                 const std::string_view op = rjson::to_string_view(it->name);
+                if (!it->value.IsObject()) {
+                    co_return api_error::validation("GlobalSecondaryIndexUpdates entries must be objects");
+                }
+                const rjson::value* index_name_v = rjson::find(it->value, "IndexName");
+                if (!index_name_v || !index_name_v->IsString()) {
+                    co_return api_error::validation("GlobalSecondaryIndexUpdates operation must have IndexName");
+                }
+                std::string_view index_name = rjson::to_string_view(*index_name_v);
+                std::string_view table_name = schema->cf_name();
+                std::string_view keyspace_name = schema->ks_name();
+                std::string vname(view_name(table_name, index_name));
                 if (op == "Create") {
-                    if (!it->value.IsObject()) {
-                        co_return api_error::validation("GlobalSecondaryIndexUpdates Create value must be an object");
-                    }
-                    const rjson::value* index_name_v = rjson::find(it->value, "IndexName");
-                    if (!index_name_v || !index_name_v->IsString()) {
-                        co_return api_error::validation("GlobalSecondaryIndexUpdates must have IndexName");
-                    }
                     const rjson::value* attribute_definitions = rjson::find(request, "AttributeDefinitions");
                     if (!attribute_definitions) {
                         co_return api_error::validation("GlobalSecondaryIndexUpdates Create needs AttributeDefinitions");
@@ -1642,10 +1647,6 @@ future<executor::request_return_type> executor::update_table(client_state& clien
                         check_attribute_definitions_conflicts(*attribute_definitions, *view);
                     }
 
-                    std::string_view index_name = rjson::to_string_view(*index_name_v);
-                    std::string_view table_name = schema->cf_name();
-                    std::string_view keyspace_name = schema->ks_name();
-                    std::string vname(view_name(table_name, index_name));
                     if (p.local().data_dictionary().has_schema(keyspace_name, vname)) {
                         // Surprisingly, DynamoDB uses validation error here, not resource_in_use
                         co_return api_error::validation(fmt::format(
@@ -1712,7 +1713,11 @@ future<executor::request_return_type> executor::update_table(client_state& clien
                     view_builder.with_view_info(*schema, include_all_columns, ""/*where clause*/);
                     new_views.emplace_back(view_builder.build());
                 } else if (op == "Delete") {
-                    co_return api_error::validation("GlobalSecondaryIndexUpdates Delete not yet supported");
+                    elogger.trace("Deleting GSI {}", index_name);
+                    if (!p.local().data_dictionary().has_schema(keyspace_name, vname)) {
+                        co_return api_error::resource_not_found(fmt::format("No GSI {} in table {}", index_name, table_name));
+                    }
+                    dropped_views.emplace_back(vname);
                 } else if (op == "Update") {
                     co_return api_error::validation("GlobalSecondaryIndexUpdates Update not yet supported");
                 } else {
@@ -1729,6 +1734,10 @@ future<executor::request_return_type> executor::update_table(client_state& clien
         auto m = co_await service::prepare_column_family_update_announcement(p.local(), schema, std::vector<view_ptr>(), group0_guard.write_timestamp());
         for (view_ptr view : new_views) {
             auto m2 = co_await service::prepare_new_view_announcement(p.local(), view, group0_guard.write_timestamp());
+            std::move(m2.begin(), m2.end(), std::back_inserter(m));
+        }
+        for (const std::string& view_name : dropped_views) {
+            auto m2 = co_await service::prepare_view_drop_announcement(p.local(), schema->ks_name(), view_name, group0_guard.write_timestamp());
             std::move(m2.begin(), m2.end(), std::back_inserter(m));
         }
 
