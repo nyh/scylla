@@ -1893,35 +1893,3 @@ def test_gsi_invalid_key_types(dynamodb):
                     'Projection': { 'ProjectionType': 'ALL' }
                 }]) as table:
                 pass
-
-# NYH CONTINUE: think if we need has_base_non_pk_columns_in_view_pk
-#  and if it's fine or not we don't set it.
-# NYH CONTINUE: upgrade tests. mixed cluster, etc.
-# NYH CONTINUE: in upgrade test: don't allow deleting old GSI when its
-#               key is a real column, but! allow deleting an old GSI when
-#               its key is also a LSI key (which can't be removed)
-# NYH CONTINUE WRITING TESTS:
-# * write a test that if we create a table with an LSI and
-#               and a GSI, the LSI can't be removed but the GSI can.
-#               Use the same key or different key (parametrize) for
-#               the GSI and LSI.
-
-# NYH TODO: write a LSI+GSI test where column x must be a real column because
-# it is a LSI key, and x,y is a GSI key (two base regular columns!), so
-# adding/deleting x,y (see scenarios in test_gsi_3_long) will need to
-# add/delete columns.
-# NYH TODO: also check a write that sets the same value (we used to have
-# a bug with that).
-# NYH TODO: write a test that does multiple GlobalSecondaryIndexUpdates in
-# the same UpdateTable. Have a successful case, e.g., trying to add two
-# GSIs and removing one, and an unusecessful case - e.g., trying to add
-# two GSIs with the same name.
-# correction: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GSI.OnlineOps.html
-#   claims that "You can only create one global secondary index per UpdateTable operation."
-#    so maybe it's not even allowed! So why is it an array? Maybe you can
-#     remove one and add one? Or maybe Update several?
-# NYH TODO: write a test for syntax errors in GlobalSecondaryIndexUpdate,
-# such as
-#   1. Instead of Create/Delete/Update, type "Dog".
-#   2. What if we have both Create and Delete in the *same* map? It's
-#      an error, right?
