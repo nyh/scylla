@@ -532,13 +532,22 @@ def test_gsi_updatetable_spurious_attribute_definitions(table1, scylla_only):
         # Just in case the update_table didn't fail as expected...
         wait_for_gsi(table1, 'gsi2')
 
+# Check that attempting to delete a GSI that doesn't exist results in
+# the expected ResourceNotFoundException.
+def test_updatetable_delete_missing_gsi(dynamodb, table1):
+    with pytest.raises(ClientError, match='ResourceNotFoundException'):
+        dynamodb.meta.client.update_table(TableName=table1.name,
+            GlobalSecondaryIndexUpdates=[{  'Delete':
+                { 'IndexName': 'nonexistent' } }])
+
 
 # TODO: test GlobalSecondaryIndexUpdates "Update" operation for setting
-# ProvisionedThrougput (that DescribeTable should retried).
+#     ProvisionedThrougput (that DescribeTable should return).
 # TODO: test we can delete a GSI that was previously added (our current
 # test deletes a GSI that was created with the table)
 # TODO: test adding GSI with a name that already exists as GSI/LSI for this table.
 # TODO: check UpdateTable permissions to create a GSI. Probably requires permissions both to update existing table and to create new table.
+# TODO: check UpdateTable permissions to delete a GSI.
 # TODO: also check autogrant on the new view and autodelete on deleted view!
 # TODO: when UpdateTable creates a GSI the different columns are created in separate code so we need to check the result actually works and has all the columns. Write a test that also has an LSI (which forces some other column to become a real column) and also write additional cells to :attrs, and see all of this is writable/readable with the new GSI.
 # TODO: check ability to add GSI, delete it and then re-add with same name.
