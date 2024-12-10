@@ -29,8 +29,7 @@ def wait_for_gsi(table, gsi_name):
     start_time = time.time()
     # Surprisingly, even for tiny tables this can take a very long time
     # on DynamoDB - often many minutes!
-    for i in range(600):
-        time.sleep(1)
+    while time.time() < start_time + 600:
         desc = table.meta.client.describe_table(TableName=table.name)
         table_status = desc['Table']['TableStatus']
         if table_status != 'ACTIVE':
@@ -40,11 +39,11 @@ def wait_for_gsi(table, gsi_name):
         assert len(index_desc) == 1
         index_status = index_desc[0]['IndexStatus']
         if index_status != 'ACTIVE':
-            print(f'{i} Index {gsi_name} status still {index_status}')
+            time.sleep(0.1)
             continue
         # When the index is ACTIVE, this must be after backfilling completed
         assert not 'Backfilling' in index_desc[0]
-        print('wait_for_gsi took %d seconds' % (time.time() - start_time))
+        print('wait_for_gsi took %f seconds' % (time.time() - start_time))
         return
     raise AssertionError("wait_for_gsi did not complete")
 
@@ -52,8 +51,7 @@ def wait_for_gsi(table, gsi_name):
 # this function waits for a GSI to be finally deleted.
 def wait_for_gsi_gone(table, gsi_name):
     start_time = time.time()
-    for i in range(600):
-        time.sleep(1)
+    while time.time() < start_time + 600:
         desc = table.meta.client.describe_table(TableName=table.name)
         table_status = desc['Table']['TableStatus']
         if table_status != 'ACTIVE':
@@ -63,9 +61,9 @@ def wait_for_gsi_gone(table, gsi_name):
             index_desc = [x for x in desc['Table']['GlobalSecondaryIndexes'] if x['IndexName'] == gsi_name]
             if len(index_desc) != 0:
                 index_status = index_desc[0]['IndexStatus']
-                print(f'{i} Index {gsi_name} status still {index_status}')
+                time.sleep(0.1)
                 continue
-        print('wait_for_gsi_gone took %d seconds' % (time.time() - start_time))
+        print('wait_for_gsi_gone took %f seconds' % (time.time() - start_time))
         return
     raise AssertionError("wait_for_gsi_gone did not complete")
 
@@ -506,6 +504,10 @@ def test_gsi_updatetable_errors(dynamodb, table1):
             ])
 
 
+# TODO: validate AttributeDefinitions unused items, etc.
 # TODO: test GlobalSecondaryIndexUpdates "Update" operation.
 # TODO: test we can delete a GSI that was previously added (our current
 # test deletes a GSI that was created with the table)
+# TODO: test adding GSI with a name that already exists as GSI/LSI for this table.
+# TODO: check UpdateTable permissions to create a GSI. Probably requires permissions both to update existing table and to create new table.
+# TODO: also check autogrant on the new view and autodelete on deleted view!
