@@ -1669,8 +1669,7 @@ future<executor::request_return_type> executor::update_table(client_state& clien
                     bool view_hash_key_real_column =
                         schema->get_column_definition(to_bytes(view_hash_key));
                     add_column(view_builder, view_hash_key, *attribute_definitions, column_kind::partition_key, !view_hash_key_real_column);
-                    // TODO: validate attribute definitions
-                    //unused_attribute_definitions.erase(view_hash_key);
+                    unused_attribute_definitions.erase(view_hash_key);
                     if (!view_range_key.empty()) {
                         bool view_range_key_real_column =
                             schema->get_column_definition(to_bytes(view_range_key));
@@ -1680,9 +1679,17 @@ future<executor::request_return_type> executor::update_table(client_state& clien
                             // FIXME: This warning should go away. See issue #6714
                             elogger.warn("Only 1 regular column from the base table should be used in the GSI key in order to ensure correct liveness management without assumptions");
                         }
-                        // TODO: validate attributed definitions
-                        //unused_attribute_definitions.erase(view_range_key);
+                        unused_attribute_definitions.erase(view_range_key);
                     }
+                    // Surprisingly, although DynamoDB checks for unused
+                    // AttributeDefinitions in CreateTable, it does not
+                    // check it in UpdateTable. We decided to check anyway.
+                    if (!unused_attribute_definitions.empty()) {
+                        co_return api_error::validation(fmt::format(
+                            "AttributeDefinitions defines spurious attributes not used by any KeySchema: {}",
+                            unused_attribute_definitions));
+                    }
+
                     // Base key columns which aren't part of the index's key need to
                     // be added to the view nonetheless, as (additional) clustering
                     // key(s).
