@@ -33,7 +33,7 @@ def wait_for_gsi(table, gsi_name):
         desc = table.meta.client.describe_table(TableName=table.name)
         table_status = desc['Table']['TableStatus']
         if table_status != 'ACTIVE':
-            print(f'{i} Table {table.name} status still {table_status}')
+            time.sleep(0.1)
             continue
         index_desc = [x for x in desc['Table']['GlobalSecondaryIndexes'] if x['IndexName'] == gsi_name]
         assert len(index_desc) == 1
@@ -55,7 +55,7 @@ def wait_for_gsi_gone(table, gsi_name):
         desc = table.meta.client.describe_table(TableName=table.name)
         table_status = desc['Table']['TableStatus']
         if table_status != 'ACTIVE':
-            print(f'{i} Table {table.name} status still {table_status}')
+            time.sleep(0.1)
             continue
         if 'GlobalSecondaryIndexes' in desc['Table']:
             index_desc = [x for x in desc['Table']['GlobalSecondaryIndexes'] if x['IndexName'] == gsi_name]
