@@ -234,7 +234,7 @@ static std::string view_name(std::string_view table_name, std::string_view index
     return ret;
 }
 
-static std::string lsi_name(const std::string& table_name, std::string_view index_name) {
+static std::string lsi_name(std::string_view table_name, std::string_view index_name) {
     return view_name(table_name, index_name, "!:");
 }
 
@@ -1519,6 +1519,32 @@ future<executor::request_return_type> executor::create_table(client_state& clien
     });
 }
 
+// When UpdateTable adds a GSI the type of its key columns must be specified
+// in a AttributeDefinitions. If one of these key columns are *already* key
+// columns of the base table or any of its prior GSIs or LSIs, the type
+// given in AttributeDefinitions must match the type of the existing key -
+// otherise Alternator will not know which type to enforce in new writes.
+// This function checks for such conflicts. It assumes that the structure of
+// the given attribute_definitions was already validated (with
+// validate_attribute_definitions()).
+// This function should be called for the base schemas, and also all its
+// views (i.e., existing GSIs and LSIs on this table).
+ static void check_attribute_definitions_conflicts(const rjson::value& attribute_definitions, const schema& schema) {
+    for (auto& def : schema.primary_key_columns()) {
+        std::string def_type = type_to_string(def.type);
+        for (auto it = attribute_definitions.Begin(); it != attribute_definitions.End(); ++it) {
+            const rjson::value& attribute_info = *it;
+            if (attribute_info["AttributeName"].GetString() == def.name_as_text()) {
+                auto type = attribute_info["AttributeType"].GetString();
+                if (type != def_type) {
+                    throw api_error::validation(fmt::format("AttributeDefinitions redefined {} to {} already a key attribute of type {} in this table", def.name_as_text(), type, def_type));
+                }
+                break;
+            }
+        }
+    }
+}
+
 future<executor::request_return_type> executor::update_table(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request) {
     _stats.api_operations.update_table++;
     elogger.trace("Updating table {}", request);
@@ -1603,20 +1629,33 @@ future<executor::request_return_type> executor::update_table(client_state& clien
                     }
                     const rjson::value* index_name_v = rjson::find(it->value, "IndexName");
                     if (!index_name_v || !index_name_v->IsString()) {
-                        co_return api_error::validation("GlobalSecondaryIndexUpdates IndexName must be a string.");
+                        co_return api_error::validation("GlobalSecondaryIndexUpdates must have IndexName");
                     }
-                    // TODO: print better message if missing
-                    const rjson::value& attribute_definitions = request["AttributeDefinitions"];
+                    const rjson::value* attribute_definitions = rjson::find(request, "AttributeDefinitions");
+                    if (!attribute_definitions) {
+                        co_return api_error::validation("GlobalSecondaryIndexUpdates Create needs AttributeDefinitions");
+                    }
+                    std::unordered_set<std::string> unused_attribute_definitions =
+                        validate_attribute_definitions(*attribute_definitions);
+                    check_attribute_definitions_conflicts(*attribute_definitions, *schema);
+                    for (auto& view : p.local().data_dictionary().find_column_family(tab).views()) {
+                        check_attribute_definitions_conflicts(*attribute_definitions, *view);
+                    }
+
                     std::string_view index_name = rjson::to_string_view(*index_name_v);
                     std::string_view table_name = schema->cf_name();
                     std::string_view keyspace_name = schema->ks_name();
-                    // TODO: validate the index name doesn't already exist as a GSI or LSI in this
-                    // table!
-                    //auto [it, added] = index_names.emplace(index_name);
-                    //if (!added) {
-                    //    co_return api_error::validation(fmt::format("Duplicate IndexName '{}', ", index_name));
-                    //}
                     std::string vname(view_name(table_name, index_name));
+                    if (p.local().data_dictionary().has_schema(keyspace_name, vname)) {
+                        // Surprisingly, DynamoDB uses validation error here, not resource_in_use
+                        co_return api_error::validation(fmt::format(
+                            "GSI {} already exists in table {}", index_name, table_name));
+                    }
+                    if (p.local().data_dictionary().has_schema(keyspace_name, lsi_name(table_name, index_name))) {
+                        co_return api_error::validation(fmt::format(
+                            "LSI {} already exists in table {}, can't use same name for GSI", index_name, table_name));
+                    }
+
                     elogger.trace("Adding GSI {}", index_name);
                     // FIXME: read and handle "Projection" parameter. This will
                     // require the MV code to copy just parts of the attrs map.
@@ -1629,13 +1668,13 @@ future<executor::request_return_type> executor::update_table(client_state& clien
                     // and deserializes the attribute from the ":attrs" map.
                     bool view_hash_key_real_column =
                         schema->get_column_definition(to_bytes(view_hash_key));
-                    add_column(view_builder, view_hash_key, attribute_definitions, column_kind::partition_key, !view_hash_key_real_column);
+                    add_column(view_builder, view_hash_key, *attribute_definitions, column_kind::partition_key, !view_hash_key_real_column);
                     // TODO: validate attribute definitions
                     //unused_attribute_definitions.erase(view_hash_key);
                     if (!view_range_key.empty()) {
                         bool view_range_key_real_column =
                             schema->get_column_definition(to_bytes(view_range_key));
-                        add_column(view_builder, view_range_key, attribute_definitions, column_kind::clustering_key, !view_range_key_real_column);
+                        add_column(view_builder, view_range_key, *attribute_definitions, column_kind::clustering_key, !view_range_key_real_column);
                         if (!schema->get_column_definition(to_bytes(view_range_key)) &&
                             !schema->get_column_definition(to_bytes(view_hash_key))) {
                             // FIXME: This warning should go away. See issue #6714
