@@ -211,6 +211,36 @@ def test_gsi_backfill_with_lsi(dynamodb):
                         'Projection': { 'ProjectionType': 'ALL' }
                     }}])
 
+# Another test similar to the above test_gsi_backfill_with_lsi() which
+# checked the new GSI key being a real column from an LSI - in this
+# test the GSI key is a real column from the base table itself.
+def test_gsi_backfill_with_real_column(dynamodb):
+    with new_test_table(dynamodb,
+            KeySchema=[
+                { 'AttributeName': 'p', 'KeyType': 'HASH' },
+                { 'AttributeName': 'c', 'KeyType': 'RANGE' }
+            ],
+            AttributeDefinitions=[
+                { 'AttributeName': 'p', 'AttributeType': 'S' },
+                { 'AttributeName': 'c', 'AttributeType': 'S' },
+            ]) as table:
+        items = [{'p': random_string(), 'c': random_string(), 'x': random_string(), 'y': random_string()} for i in range(10)]
+        with table.batch_writer() as batch:
+            for item in items:
+                batch.put_item(item)
+        assert multiset(items) == multiset(full_scan(table))
+        # Now use UpdateTable to create the GSI, with the key "c", already
+        # a key column in the base table
+        dynamodb.meta.client.update_table(TableName=table.name,
+            AttributeDefinitions=[{ 'AttributeName': 'c', 'AttributeType': 'S' }],
+            GlobalSecondaryIndexUpdates=[ {  'Create':
+                {   'IndexName': 'gsi',
+                    'KeySchema': [{ 'AttributeName': 'c', 'KeyType': 'HASH' }],
+                    'Projection': { 'ProjectionType': 'ALL' }
+                }}])
+        wait_for_gsi(table, 'gsi')
+        assert multiset(items) == multiset(full_scan(table, ConsistentRead=False, IndexName='gsi'))
+
 # Test deleting an existing GSI using UpdateTable
 def test_gsi_delete(dynamodb):
     with new_test_table(dynamodb,
@@ -628,18 +658,18 @@ def test_updatetable_delete_missing_gsi(dynamodb, table1):
                 { 'IndexName': 'nonexistent' } }])
 
 
+# NYH TODO: write a LSI+GSI test where column x must be a real column because
+# it is a LSI key, and x,y is a GSI key (two base regular columns!), so
+# adding/deleting x,y (see scenarios in test_gsi_3_long) will need to
+# add/delete columns.
 # TODO: when UpdateTable creates a GSI the different columns are created in separate code so we need to check the result actually works and has all the columns. Write a test that also has an LSI (which forces some other column to become a real column) and also write additional cells to :attrs, and see all of this is writable/readable with the new GSI.
-# TODO: check if we have a test where one of GSI keys is already a
-#       key of a the base table or an LSI or GSI.
 # NYH CONTINUE: think if we need has_base_non_pk_columns_in_view_pk
 #  and if it's fine or not we don't set it.
 # NYH CONTINUE: upgrade tests. mixed cluster, etc.
 # NYH CONTINUE: in upgrade test: don't allow deleting old GSI when its
 #               key is a real column, but! allow deleting an old GSI when
 #               its key is also a LSI key (which can't be removed)
-# NYH TODO: write a LSI+GSI test where column x must be a real column because
-# it is a LSI key, and x,y is a GSI key (two base regular columns!), so
-# adding/deleting x,y (see scenarios in test_gsi_3_long) will need to
-# add/delete columns.
 # NYH TODO: also check a write that sets the same value (we used to have
 # a bug with that).
+# NYH TODO: do we have tests for GSI with different types of keys, not
+# just string? The serialization code is new and needs to be exercises.
