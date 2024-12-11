@@ -322,6 +322,72 @@ def test_gsi_delete_with_lsi(dynamodb):
             dynamodb.meta.client.update_table(TableName=table.name,
                 GlobalSecondaryIndexUpdates=[{ 'Delete': { 'IndexName': 'lsi' } }])
 
+# In the previous tests we performed a UpdateTable GSI Create or Delete
+# operation on a table set up by CreateTable. In this test we try several
+# of these operations in sequence, to check we can add more than one GSI,
+# delete a GSI that we just added, recreate a GSI that we just deleted, etc.
+def test_gsi_creates_and_deletes(dynamodb):
+    schema = {
+        'KeySchema': [ { 'AttributeName': 'p', 'KeyType': 'HASH' } ],
+        'AttributeDefinitions': [ { 'AttributeName': 'p', 'AttributeType': 'S' }]
+    }
+    create_gsi = lambda name, key: {
+        'AttributeDefinitions': [{ 'AttributeName': key, 'AttributeType': 'S' }],
+        'GlobalSecondaryIndexUpdates': [
+            {  'Create':
+                {  'IndexName': name,
+                    'KeySchema': [{ 'AttributeName': key, 'KeyType': 'HASH' }],
+                    'Projection': { 'ProjectionType': 'ALL' }
+                }
+            }
+        ]}
+    delete_gsi = lambda name: {
+        'GlobalSecondaryIndexUpdates': [
+            {  'Delete': { 'IndexName': name } }
+        ]}
+    with new_test_table(dynamodb, **schema) as table:
+        items = [{'p': random_string(), 'x': random_string(), 'y': random_string()} for i in range(10)]
+        with table.batch_writer() as batch:
+            for item in items:
+                batch.put_item(item)
+        # Create indexes gsi1 and gsi2 for "x" and for "y" respectively,
+        # in two separate UpdateTable requests:
+        dynamodb.meta.client.update_table(
+            TableName=table.name, **create_gsi('gsi1', 'x'))
+        wait_for_gsi(table, 'gsi1')
+        dynamodb.meta.client.update_table(
+            TableName=table.name, **create_gsi('gsi2', 'y'))
+        wait_for_gsi(table, 'gsi2')
+        # We have the index for "x" and "y" and can use it. We don't
+        # need a retry loop (like assert_index_query()) because we waited
+        # for the view build to complete.
+        assert [items[3]] == full_query(table,
+            ConsistentRead=False, IndexName='gsi1',
+            KeyConditions={'x': {'AttributeValueList': [items[3]['x']], 'ComparisonOperator': 'EQ'}})
+        assert [items[3]] == full_query(table,
+            ConsistentRead=False, IndexName='gsi2',
+            KeyConditions={'y': {'AttributeValueList': [items[3]['y']], 'ComparisonOperator': 'EQ'}})
+        # Now delete the GSI for "x" that we added above:
+        dynamodb.meta.client.update_table(
+            TableName=table.name, **delete_gsi('gsi1'))
+        wait_for_gsi_gone(table, 'gsi1')
+        # Now index for x is gone. We cannot query using it, but index for y
+        # is still there:
+        with pytest.raises(ClientError, match='ValidationException.*gsi1'):
+            full_query(table, ConsistentRead=False, IndexName='gsi1',
+                KeyConditions={'x': {'AttributeValueList': [items[3]['x']], 'ComparisonOperator': 'EQ'}})
+        assert [items[3]] == full_query(table,
+            ConsistentRead=False, IndexName='gsi2',
+            KeyConditions={'y': {'AttributeValueList': [items[3]['y']], 'ComparisonOperator': 'EQ'}})
+        # Finally, re-add an index gsi1 for "x", and see it begins to work
+        # again:
+        dynamodb.meta.client.update_table(
+            TableName=table.name, **create_gsi('gsi1', 'x'))
+        wait_for_gsi(table, 'gsi1')
+        assert [items[3]] == full_query(table,
+            ConsistentRead=False, IndexName='gsi1',
+            KeyConditions={'x': {'AttributeValueList': [items[3]['x']], 'ComparisonOperator': 'EQ'}})
+
 # As noted in test_gsi.py's test_gsi_empty_value(), setting an indexed string
 # column to an empty string is rejected, since keys (including GSI keys) are
 # not allowed to be empty strings or binary blobs.
@@ -553,14 +619,7 @@ def test_updatetable_delete_missing_gsi(dynamodb, table1):
                 { 'IndexName': 'nonexistent' } }])
 
 
-# TODO: test GlobalSecondaryIndexUpdates "Update" operation for setting
-#     ProvisionedThrougput (that DescribeTable should return).
-# TODO: test we can delete a GSI that was previously added (our current
-# test deletes a GSI that was created with the table)
 # TODO: test adding GSI with a name that already exists as GSI/LSI for this table.
-# TODO: check UpdateTable permissions to create a GSI. Probably requires permissions both to update existing table and to create new table.
-# TODO: check UpdateTable permissions to delete a GSI.
-# TODO: also check autogrant on the new view and autodelete on deleted view!
 # TODO: when UpdateTable creates a GSI the different columns are created in separate code so we need to check the result actually works and has all the columns. Write a test that also has an LSI (which forces some other column to become a real column) and also write additional cells to :attrs, and see all of this is writable/readable with the new GSI.
 # TODO: check ability to add GSI, delete it and then re-add with same name.
 # TODO: check ability to add GSI, then add a second GSI.
