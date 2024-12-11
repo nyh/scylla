@@ -295,6 +295,15 @@ def test_gsi_delete_with_lsi(dynamodb):
         # So far, we have the GSI for "x" and can use it:
         assert_index_query(table, 'gsi', [items[3]],
             KeyConditions={'x': {'AttributeValueList': [items[3]['x']], 'ComparisonOperator': 'EQ'}})
+        # As a sanity check, see we can't create a GSI called 'gsi' because
+        # this name is already taken.
+        with pytest.raises(ClientError, match='ValidationException.*already exists'):
+            dynamodb.meta.client.update_table(TableName=table.name,
+                AttributeDefinitions=[{ 'AttributeName': 'x', 'AttributeType': 'S' }],
+                GlobalSecondaryIndexUpdates=[{ 'Create': {
+                    'IndexName': 'gsi',
+                    'KeySchema': [{ 'AttributeName': 'x', 'KeyType': 'HASH' }],
+                    'Projection': { 'ProjectionType': 'ALL' }}}])
         # Now use UpdateTable to delete the GSI for "x"
         dynamodb.meta.client.update_table(TableName=table.name,
             GlobalSecondaryIndexUpdates=[{ 'Delete': { 'IndexName': 'gsi' } }])
@@ -619,10 +628,7 @@ def test_updatetable_delete_missing_gsi(dynamodb, table1):
                 { 'IndexName': 'nonexistent' } }])
 
 
-# TODO: test adding GSI with a name that already exists as GSI/LSI for this table.
 # TODO: when UpdateTable creates a GSI the different columns are created in separate code so we need to check the result actually works and has all the columns. Write a test that also has an LSI (which forces some other column to become a real column) and also write additional cells to :attrs, and see all of this is writable/readable with the new GSI.
-# TODO: check ability to add GSI, delete it and then re-add with same name.
-# TODO: check ability to add GSI, then add a second GSI.
 # TODO: check if we have a test where one of GSI keys is already a
 #       key of a the base table or an LSI or GSI.
 # NYH CONTINUE: think if we need has_base_non_pk_columns_in_view_pk
