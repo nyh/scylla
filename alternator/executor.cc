@@ -1740,6 +1740,25 @@ future<executor::request_return_type> executor::update_table(client_state& clien
             auto m2 = co_await service::prepare_view_drop_announcement(p.local(), schema->ks_name(), view_name, group0_guard.write_timestamp());
             std::move(m2.begin(), m2.end(), std::back_inserter(m));
         }
+        // If a role is allowed to create a GSI, we should give it permissions
+        // to read the GSI it just created. This is known as "auto-grant".
+        // Also, when we delete a GSI we should revoke any permissions set on
+        // it - so if it's ever created again the old permissions wouldn't be
+        // remembered for the new GSI. This is known as "auto-revoke"
+        if (client_state_other_shard.get().user() && (!new_views.empty() || !dropped_views.empty())) {
+            service::group0_batch mc(std::move(group0_guard));
+            mc.add_mutations(std::move(m));
+            for (view_ptr view : new_views) {
+                auto resource = auth::make_data_resource(view->ks_name(), view->cf_name());
+                co_await auth::grant_applicable_permissions(
+                    *client_state_other_shard.get().get_auth_service(), *client_state_other_shard.get().user(), resource, mc);
+            }
+            for (const auto& view_name : dropped_views) {
+                auto resource = auth::make_data_resource(schema->ks_name(), view_name);
+                co_await auth::revoke_all(*client_state_other_shard.get().get_auth_service(), resource, mc);
+        }
+            std::tie(m, group0_guard) = co_await std::move(mc).extract();
+        }
 
         co_await mm.announce(std::move(m), std::move(group0_guard), format("alternator-executor: update {} table", tab->cf_name()));
 
