@@ -386,7 +386,7 @@ public:
         _pk = key.explode();
     }
     void accept_new_partition(uint64_t row_count) {
-        throw std::logic_error("view_filter_checking_visitor expects an explicit partition key");
+        throw std::logic_error("view_filter_che-cking_visitor expects an explicit partition key");
     }
 
     void accept_new_row(const clustering_key& key, const query::result_row_view& static_row, const query::result_row_view& row) {
@@ -1312,10 +1312,17 @@ void view_updates::generate_update(
                 // if the update is a static row we only need to check for base static
                 // rows. So if we cache this, we need to cache two verison - like
                 // we had base_regular/static_columns_in_view_pk. But I don't understand why.
-                atomic_cell_view after = update.cells().find_cell(base_col->id)->as_atomic_cell(*base_col);
+                std::optional<atomic_cell_view> after;
+                auto afterp = update.cells().find_cell(base_col->id);
+                if (afterp) {
+                    after = afterp->as_atomic_cell(*base_col);
+                }
                 std::optional<atomic_cell_view> before;
                 if (existing) {
-                    before = existing->cells().find_cell(base_col->id)->as_atomic_cell(*base_col);
+                    auto beforep = existing->cells().find_cell(base_col->id);
+                    if (beforep) {
+                        before = beforep->as_atomic_cell(*base_col);
+                    }
                 }
                 updatable_view_key_cols.emplace_back(view_col.id,
                     before ? (
@@ -1324,9 +1331,12 @@ void view_updates::generate_update(
                             regular_column_transformation::result::deleted_value(before->timestamp())
                         ) :
                         regular_column_transformation::result::missing_value(),
-                    after.is_live() ?
-                        regular_column_transformation::result::value(to_bytes(after.value()), after.timestamp()) :
-                        regular_column_transformation::result::deleted_value(after.timestamp())
+                    after ? (
+                        after->is_live() ?
+                            regular_column_transformation::result::value(to_bytes(after->value()), after->timestamp()) :
+                            regular_column_transformation::result::deleted_value(after->timestamp())
+                        ) :
+                        regular_column_transformation::result::missing_value()
                     );
             }
         }
