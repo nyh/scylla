@@ -17,13 +17,16 @@ import boto3
 from botocore.exceptions import ClientError
 import time
 from contextlib import contextmanager
-from test.alternator.util import is_aws, unique_table_name, random_string, new_test_table
 from functools import cache
 
 from cassandra.auth import PlainTextAuthProvider
 from cassandra.cluster import Cluster, ConsistencyLevel, ExecutionProfile, EXEC_PROFILE_DEFAULT, NoHostAvailable
 from cassandra.policies import RoundRobinPolicy
 import re
+
+from .util import is_aws, unique_table_name, random_string, new_test_table
+from .test_gsi_updatetable import wait_for_gsi, wait_for_gsi_gone
+from .test_gsi import assert_index_query
 
 # This file is all about testing RBAC as configured via CQL, so we need to
 # connect to CQL to set these tests up. The "cql" fixture below enables that.
@@ -669,6 +672,167 @@ def test_rbac_updatetable(dynamodb, cql):
                     authorized(lambda: tab.meta.client.update_table(TableName=tab.name,
                         BillingMode='PAY_PER_REQUEST'))
 
+# Above we checked UpdateTable's operation to change BillingMode, and that
+# it requires the ALTER permissions. But UpdateTable has a more interesting
+# ability - to *create* and to *delete* a GSI from the base table. In this
+# test we verify that this ability too requires ALTER permissions on the
+# affected table. Basically *any* UpdateTable invocation requires ALTER
+# permissions.
+# This observation can be surprising - why doesn't creating a GSI require
+# CREATE permissions and dropping a GSI require DROP permissions? It turns
+# out that requiring ALTER permissions makes sense if you consider the
+# existence of the GSI to be a feature of the base table - it affects the
+# capabilities and performance of the base table. In other words, adding a
+# GSI really modifies the behavior of the base table and should require an
+# ALTER permission on that table - it's not the same as permitting a user
+# to create a completely separate and independent table.
+# Below we also have two additional tests for auto-grant when creating a GSI,
+# and auto-revoke when deleting it.
+def test_rbac_updatetable_gsi(dynamodb, cql):
+    schema = {
+        'KeySchema': [ { 'AttributeName': 'p', 'KeyType': 'HASH' } ],
+        'AttributeDefinitions': [ { 'AttributeName': 'p', 'AttributeType': 'S' }]
+    }
+    create_gsi = {
+        'AttributeDefinitions': [{ 'AttributeName': 'x', 'AttributeType': 'S' }],
+        'GlobalSecondaryIndexUpdates': [
+            {  'Create':
+                {  'IndexName': 'hello',
+                    'KeySchema': [{ 'AttributeName': 'x', 'KeyType': 'HASH' }],
+                    'Projection': { 'ProjectionType': 'ALL' }
+                }
+            }
+        ]}
+    delete_gsi = {
+        'GlobalSecondaryIndexUpdates': [
+            {  'Delete': { 'IndexName': 'hello' } }
+        ]}
+    with new_test_table(dynamodb, **schema) as table:
+        with new_role(cql) as (role, key):
+            with new_dynamodb(dynamodb, role, key) as d:
+                tab = d.Table(table.name)
+                # Without ALTER permissions, UpdateTable GSI Create won't work.
+                unauthorized(lambda: tab.meta.client.update_table(TableName=tab.name,
+                    **create_gsi))
+                # With ALTER permissions, it works.
+                with temporary_grant(cql, 'ALTER', cql_table_name(tab), role):
+                    authorized(lambda: tab.meta.client.update_table(TableName=tab.name,
+                        **create_gsi))
+                wait_for_gsi(tab, 'hello')
+                # Without ALTER permissions, UpdateTable GSI Delete won't work.
+                # Note that the GSI Delete operation checks for the existence
+                # of the GSI before checking the permissions, so we need to
+                # test this when the GSI actually exists.
+                unauthorized(lambda: tab.meta.client.update_table(TableName=tab.name,
+                    **delete_gsi))
+                # With ALTER permissions, it works.
+                with temporary_grant(cql, 'ALTER', cql_table_name(tab), role):
+                    authorized(lambda: tab.meta.client.update_table(TableName=tab.name,
+                        **delete_gsi))
+                wait_for_gsi_gone(tab, 'hello')
+
+# Test the "autogrant" feature of UpdateTable's GSI Create feature: If a role
+# is allowed to create a GSI, this role is automatically given full (SELECT)
+# permissions to the newly-created GSI.
+def test_rbac_updatetable_gsi_autogrant(dynamodb, cql):
+    schema = {
+        'KeySchema': [ { 'AttributeName': 'p', 'KeyType': 'HASH' } ],
+        'AttributeDefinitions': [ { 'AttributeName': 'p', 'AttributeType': 'S' }]
+    }
+    create_gsi = {
+        'AttributeDefinitions': [{ 'AttributeName': 'x', 'AttributeType': 'S' }],
+        'GlobalSecondaryIndexUpdates': [
+            {  'Create':
+                {  'IndexName': 'hello',
+                    'KeySchema': [{ 'AttributeName': 'x', 'KeyType': 'HASH' }],
+                    'Projection': { 'ProjectionType': 'ALL' }
+                }
+            }
+        ]
+    }
+    with new_test_table(dynamodb, **schema) as table:
+        with new_role(cql) as (role, key):
+            with new_dynamodb(dynamodb, role, key) as d:
+                tab = d.Table(table.name)
+                # Without ALTER permissions, UpdateTable GSI Create won't work:
+                unauthorized(lambda: tab.meta.client.update_table(
+                    TableName=tab.name, **create_gsi))
+                # Adding ALTER permissions, it should work
+                with temporary_grant(cql, 'ALTER', cql_table_name(tab), role):
+                    authorized(lambda: tab.meta.client.update_table(
+                        TableName=tab.name, **create_gsi))
+                # Check that after being allowed to create the GSI, this role
+                # is automatically granted permissions to SELECT from this
+                # GSI.
+                # To make the read test more realistic, let's add some data
+                # to the table (we need to write the data through "table",
+                # the superuser role, because "tab" lacks the permissions)
+                p = random_string()
+                x = random_string()
+                v = random_string()
+                item = {'p': p, 'x': x, 'v': v}
+                table.put_item(Item=item)
+                authorized(lambda: assert_index_query(tab, 'hello', [item],
+                    KeyConditions={'x': {'AttributeValueList': [x], 'ComparisonOperator': 'EQ'}}))
+
+# Test the "autorevoke" feature of UpdateTable's GSI Delete feature: If a role
+# had SELECT permissions on some GSI, and this GSI is deleted, the permissions
+# on the deleted GSI are revoked. If we didn't, it is possible for role1
+# to create a GSI, delete it, and then role2 creates a GSI with the same
+# name and role1 might be able to read it.
+def test_rbac_updatetable_gsi_autorevoke(dynamodb, cql):
+    schema = {
+        'KeySchema': [ { 'AttributeName': 'p', 'KeyType': 'HASH' } ],
+        'AttributeDefinitions': [
+            { 'AttributeName': 'p', 'AttributeType': 'S' },
+            { 'AttributeName': 'x', 'AttributeType': 'S' }
+        ],
+        'GlobalSecondaryIndexes': [
+            { 'IndexName': 'hello',
+              'KeySchema': [{ 'AttributeName': 'x', 'KeyType': 'HASH' }],
+              'Projection': { 'ProjectionType': 'ALL' }
+            }
+        ]
+    }
+    delete_gsi = {
+        'GlobalSecondaryIndexUpdates': [
+            {  'Delete': { 'IndexName': 'hello' } }
+        ]
+    }
+    create_gsi = {
+        'AttributeDefinitions': [{ 'AttributeName': 'x', 'AttributeType': 'S' }],
+        'GlobalSecondaryIndexUpdates': [
+            {  'Create':
+                {  'IndexName': 'hello',
+                    'KeySchema': [{ 'AttributeName': 'x', 'KeyType': 'HASH' }],
+                    'Projection': { 'ProjectionType': 'ALL' }
+                }
+            }
+        ]
+    }
+    with new_test_table(dynamodb, **schema) as table:
+        with new_role(cql) as (role, key):
+            with new_dynamodb(dynamodb, role, key) as d:
+                tab = d.Table(table.name)
+                with temporary_grant(cql, 'SELECT', cql_gsi_name(table, 'hello'), role):
+                    # role was given permission to SELECT this index
+                    # so a query on tab's index "hello" should work.
+                    authorized(lambda: tab.query(IndexName='hello', KeyConditions={'x': {'AttributeValueList': ['hi'], 'ComparisonOperator': 'EQ'}}))
+                    # Now, delete the GSI (using the superuser connection
+                    # "dynamodb"). We hope the special permissions that role
+                    # got on this defunct GSI are gone too, as we'll check
+                    # below.
+                    dynamodb.meta.client.update_table(
+                        TableName=table.name, **delete_gsi)
+                    # Now, the superuser create a GSI with the same name
+                    # again, *without* giving role any permissions.
+                    # Check that role really can't read the new GSI.
+                    dynamodb.meta.client.update_table(
+                        TableName=table.name, **create_gsi)
+                    unauthorized(lambda: tab.query(IndexName='hello', KeyConditions={'x': {'AttributeValueList': ['hi'], 'ComparisonOperator': 'EQ'}}))
+                    # (the superuser can read the new GSI, of course)
+                    table.query(IndexName='hello', KeyConditions={'x': {'AttributeValueList': ['hi'], 'ComparisonOperator': 'EQ'}})
+
 # A test for API operations that do not require any permissions, so can be
 # performed on a new role with no grants. This currently includes
 # ListTables, DescribeTable, DescribeEndpoints, ListTagsOfResource,
@@ -977,3 +1141,20 @@ def test_rbac_system_table(dynamodb, cql):
             # read will succeed:
             with temporary_grant(cql, 'SELECT', tbl1, role):
                 authorized(lambda: client.scan(TableName=internal_prefix+tbl1))
+
+# TODO:
+# 1. Test that an UpdateTable that creates a GSI needs permission - which
+#    ALTER for the base table? CREATE? Today we have ALTER and I think it
+#    makes most sense - you are modifying the existing table which the
+#    current owner of the table might not like.
+#    If it will no longer be ALTER we need to document the different
+#    decision it in docs/alternator/compatibility.md. Will we break
+#    the each-command-needs-one-permission rule?
+#    Check which permissions "CREATE MATERIALIZED VIEW" needs. Is it
+#    also ALTER? There is no documentation I could find so write a test
+#    (in cqlpy) and ask Tzach and others.
+# 2. Test that UpdateTable that creates a GSI autogrants permissions for
+#    this view
+# 3. Test that UpdateTable that deletes a GSI autorevokes permissions on
+#    the deleted view. (it's not a very interesting case, but theoretically
+#    might be interesting)
