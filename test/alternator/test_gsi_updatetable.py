@@ -309,6 +309,18 @@ def test_gsi_delete_with_lsi(dynamodb):
         # allowed to insert items with a number for x.
         with pytest.raises(ClientError, match='ValidationException.*mismatch'):
             table.put_item(Item={'p': random_string(), 'c': random_string(), 'x': 7})
+        # Of course, we can't delete the same GSI again after it's deleted
+        with pytest.raises(ClientError, match='ResourceNotFoundException'):
+            dynamodb.meta.client.update_table(TableName=table.name,
+                GlobalSecondaryIndexUpdates=[{ 'Delete': { 'IndexName': 'gsi' } }])
+        # A GSI can be deleted, but an LSI can't. Alternator and DynamoDB
+        # give different errors in this case - Alternator gives a
+        # ResourceNotFoundException since no such GSI exists, but DynamoDB
+        # gives a ValidationException saying it knows it's an index but
+        # it's not a GSI. I think this difference is acceptable.
+        with pytest.raises(ClientError, match='ResourceNotFoundException|ValidationException'):
+            dynamodb.meta.client.update_table(TableName=table.name,
+                GlobalSecondaryIndexUpdates=[{ 'Delete': { 'IndexName': 'lsi' } }])
 
 # As noted in test_gsi.py's test_gsi_empty_value(), setting an indexed string
 # column to an empty string is rejected, since keys (including GSI keys) are
@@ -554,3 +566,15 @@ def test_updatetable_delete_missing_gsi(dynamodb, table1):
 # TODO: check ability to add GSI, then add a second GSI.
 # TODO: check if we have a test where one of GSI keys is already a
 #       key of a the base table or an LSI or GSI.
+# NYH CONTINUE: think if we need has_base_non_pk_columns_in_view_pk
+#  and if it's fine or not we don't set it.
+# NYH CONTINUE: upgrade tests. mixed cluster, etc.
+# NYH CONTINUE: in upgrade test: don't allow deleting old GSI when its
+#               key is a real column, but! allow deleting an old GSI when
+#               its key is also a LSI key (which can't be removed)
+# NYH TODO: write a LSI+GSI test where column x must be a real column because
+# it is a LSI key, and x,y is a GSI key (two base regular columns!), so
+# adding/deleting x,y (see scenarios in test_gsi_3_long) will need to
+# add/delete columns.
+# NYH TODO: also check a write that sets the same value (we used to have
+# a bug with that).
