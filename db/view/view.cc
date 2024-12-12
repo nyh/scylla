@@ -979,7 +979,7 @@ static void add_cells_to_view(const schema& base, const schema& view, column_kin
  * This method checks that the base row does match the view filter before applying anything.
  */
 void view_updates::create_entry(data_dictionary::database db, const partition_key& base_key, const clustering_or_static_row& update, gc_clock::time_point now, api::timestamp_type ts) {
-    vlogger.warn("NYH create_entry");
+    vlogger.warn("NYH create_entry update clustering={}", update.is_clustering_row());
     if (!matches_view_filter(db, *_base, _view_info, base_key, update, now)) {
         return;
     }
@@ -1226,7 +1226,7 @@ void view_updates::generate_update(
         const clustering_or_static_row& update,
         const std::optional<clustering_or_static_row>& existing,
         gc_clock::time_point now) {
-    vlogger.warn("NYH generate_entry");
+    vlogger.warn("NYH generate_update() update.clustering={} view {}", update.is_clustering_row(), _view->cf_name());
     // "update" always includes the *base* table's key columns (but possibly
     // not the view's additional key columns if there's any) because an update
     // to the base table needs to specify its keep. However, supposedly in a
@@ -1304,8 +1304,13 @@ void view_updates::generate_update(
             // it can't possibly change in this update. But the column was not
             // not a primary key column - i.e., a regular column or static
             // column, the update might have changed it and we need to list it
-            // on updatable_view_key_cols:
-            if (!base_col->is_primary_key()) {
+            // on updatable_view_key_cols.
+            // We check base_col->kind == update.column_kind() instead of just
+            // !base_col->is_primary_key() because when update is a static row
+            // we know it can't possibly update a regular column (and vice
+            // versa).
+            if (base_col->kind == update.column_kind()) {
+                vlogger.warn("NYH found updatatable view key column: {}", base_col->name_as_text());
                 // This is view key, so we know it is atomic
                 // TODO: according to the old code, it seems that if the update is a
                 // regular row we only need to look at the regular columns in the base,
@@ -1341,6 +1346,14 @@ void view_updates::generate_update(
             }
         }
     }
+    // The view has a non-primary-key column from the base table as its primary key.
+    // That means it's either a regular or static column. If we are currently
+    // processing an update which does not correspond to the column's kind,
+    // just stop here.
+    if (updatable_view_key_cols.empty()) {
+        return;
+    }
+
     // Use updatable_view_key_cols - the before and after values of the
     // view key columns that may have changed, to determine if the update
     // changes an existing view row (same_row) or deletes an old row
@@ -1758,6 +1771,7 @@ future<std::optional<utils::chunked_vector<frozen_mutation_and_schema>>> view_up
 }
 
 void view_update_builder::generate_update(clustering_row&& update, std::optional<clustering_row>&& existing) {
+    vlogger.warn("NYH view_update_builder::generate_update clustering {}", clustering_row::printer(*_base.schema(), update));
     if (update.empty()) {
         // An empty update row (no cells and no tombstone) is rare, but it is
         // possible (see #15228): A mutation can modify a column that was
@@ -1791,6 +1805,7 @@ void view_update_builder::generate_update(clustering_row&& update, std::optional
 
 void view_update_builder::generate_update(static_row&& update, const tombstone& update_tomb,
         std::optional<static_row>&& existing, const tombstone& existing_tomb) {
+    vlogger.warn("NYH view_update_builder::generate_update static {}", static_row::printer(*_base.schema(), update));
     if (!update_tomb && update.empty()) {
         throw std::logic_error("A materialized view update cannot be empty");
     }
