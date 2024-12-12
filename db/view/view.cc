@@ -1289,9 +1289,11 @@ void view_updates::generate_update(
                         existing ? c->compute_value(*_base, base_key, *existing) : regular_column_transformation::result::missing_value(),
                         c->compute_value(*_base, base_key, update));
                 } else {
-                    // unexpected, we don't have other types of computation
-                    // that depend on non-primary key column.
-                    on_internal_error(vlogger, "unexpected computation type");
+                    // We assume this a collection_column_computation used
+                    // just in secondary index of collection columns, and
+                    // we have a special code path to handle this case.
+                    // TODO: clean up this mess.
+                    return update_entry_for_computed_column(base_key, update, existing, now);
                 }
             }
         } else {
