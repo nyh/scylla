@@ -978,7 +978,7 @@ static void add_cells_to_view(const schema& base, const schema& view, column_kin
  * Creates a view entry corresponding to the provided base row.
  * This method checks that the base row does match the view filter before applying anything.
  */
-void view_updates::create_entry(data_dictionary::database db, const partition_key& base_key, const clustering_or_static_row& update, gc_clock::time_point now, api::timestamp_type ts) {
+void view_updates::create_entry(data_dictionary::database db, const partition_key& base_key, const clustering_or_static_row& update, gc_clock::time_point now, row_marker rm) {
     vlogger.warn("NYH create_entry update clustering={}", update.is_clustering_row());
     if (!matches_view_filter(db, *_base, _view_info, base_key, update, now)) {
         return;
@@ -986,8 +986,8 @@ void view_updates::create_entry(data_dictionary::database db, const partition_ke
 
     auto view_rows = get_view_rows(base_key, update, std::nullopt, {});
     // NYH: we should get the timestamp from the caller, but I'm not sure if I fixed all the callers so let's allow missing timestamp and call compute_row_marker
-    // NYH TODO: need to get not just ts but also ttl and expiry.... :-( This code probably won't work when there is ttl and expiry (it doesn't happen in Alternator, but still...)
-    auto update_marker = (ts == api::missing_timestamp) ? compute_row_marker(update) : row_marker(ts);
+    // NYH TODO (I DID IT NOW): need to get not just ts but also ttl and expiry.... :-( This code probably won't work when there is ttl and expiry (it doesn't happen in Alternator, but still...) 
+    auto update_marker = rm.is_missing() ? compute_row_marker(update) : rm;
     const auto kind = update.column_kind();
     for (const auto& [r, action]: view_rows) {
         if (auto rm = std::get_if<row_marker>(&action)) {
@@ -1157,31 +1157,31 @@ bool view_updates::can_skip_view_updates(const clustering_or_static_row& update,
  * This method checks that the base row (before and after) matches the view filter before
  * applying anything.
  */
-void view_updates::update_entry(data_dictionary::database db, const partition_key& base_key, const clustering_or_static_row& update, const clustering_or_static_row& existing, gc_clock::time_point now, api::timestamp_type ts) {
-    vlogger.warn("NYH update_entry ts={}", ts);
+void view_updates::update_entry(data_dictionary::database db, const partition_key& base_key, const clustering_or_static_row& update, const clustering_or_static_row& existing, gc_clock::time_point now, row_marker rm) {
+    vlogger.warn("NYH update_entry rm={}", rm);
     // While we know update and existing correspond to the same view entry,
     // they may not match the view filter.
     if (!matches_view_filter(db, *_base, _view_info, base_key, existing, now)) {
-        vlogger.warn("NYH update_entry create_entry case", ts);
-        create_entry(db, base_key, update, now, ts);
+        vlogger.warn("NYH update_entry create_entry case {}", rm);
+        create_entry(db, base_key, update, now, rm);
         return;
     }
     if (!matches_view_filter(db, *_base, _view_info, base_key, update, now)) {
-        vlogger.warn("NYH update_entry do_delete_old_entry case", ts);
-        do_delete_old_entry(base_key, existing, update, now, ts);
+        vlogger.warn("NYH update_entry do_delete_old_entry case {}", rm);
+        do_delete_old_entry(base_key, existing, update, now, rm.timestamp());
         return;
     }
 
     if (can_skip_view_updates(update, existing)) {
-        vlogger.warn("NYH update_entry skip case", ts);
+        vlogger.warn("NYH update_entry skip case {}", rm);
         return;
     }
 
-    vlogger.warn("NYH update_entry general case", ts);
+    vlogger.warn("NYH update_entry general case {}", rm);
     auto view_rows = get_view_rows(base_key, update, std::nullopt, {});
     // NYH: we should get the timestamp from the caller, but I'm not sure if I fixed all the callers so let's allow missing timestamp and call compute_row_marker
     // NYH TODO: need to get not just ts but also ttl and expiry.... :-( This code probably won't work when there is ttl and expiry (it doesn't happen in Alternator, but still...)
-    auto update_marker = (ts == api::missing_timestamp) ? compute_row_marker(update) : row_marker(ts);
+    auto update_marker = rm.is_missing() ? compute_row_marker(update) : rm;
 
     const auto kind = update.column_kind();
     for (const auto& [r, action] : view_rows) {
@@ -1251,12 +1251,12 @@ void view_updates::generate_update(
         // The view key is necessarily the same pre and post update.
         if (existing && existing->is_live(*_base)) {
             if (update.is_live(*_base)) {
-                update_entry(db, base_key, update, *existing, now, api::missing_timestamp);
+                update_entry(db, base_key, update, *existing, now, row_marker());
             } else {
                 delete_old_entry(db, base_key, *existing, update, now, api::missing_timestamp);
             }
         } else if (update.is_live(*_base)) {
-            create_entry(db, base_key, update, now, api::missing_timestamp);
+            create_entry(db, base_key, update, now, row_marker());
         }
         return;
     }
@@ -1333,14 +1333,20 @@ void view_updates::generate_update(
                 }
                 updatable_view_key_cols.emplace_back(view_col.id,
                     before ? (
+                        // NYH TODO: this constructor is super ugly. We should have a constructor that takes an
+                        // atomic_cell_view and does the right construction!
                         before->is_live() ?
-                            regular_column_transformation::result::value(to_bytes(before->value()), before->timestamp()) :
+                            regular_column_transformation::result::value(to_bytes(before->value()), before->timestamp(),
+                                before->is_live_and_has_ttl() ? before->ttl() : regular_column_transformation::result::no_ttl,
+                                before->is_live_and_has_ttl() ? before->expiry() : regular_column_transformation::result::no_expiry) :
                             regular_column_transformation::result::deleted_value(before->timestamp())
                         ) :
                         regular_column_transformation::result::missing_value(),
                     after ? (
                         after->is_live() ?
-                            regular_column_transformation::result::value(to_bytes(after->value()), after->timestamp()) :
+                            regular_column_transformation::result::value(to_bytes(after->value()), after->timestamp(),
+                                after->is_live_and_has_ttl() ? after->ttl() : regular_column_transformation::result::no_ttl,
+                                after->is_live_and_has_ttl() ? after->expiry() : regular_column_transformation::result::no_expiry) :
                             regular_column_transformation::result::deleted_value(after->timestamp())
                         ) :
                         regular_column_transformation::result::missing_value()
@@ -1384,7 +1390,7 @@ void view_updates::generate_update(
     // Calculate new_row_ts, only if has_new_row. This is the logic that used
     // to be in compute_row_marker() and is no longer used.
     // TODO: may need to also have ttl, not just ts, so perahps have new_row_marker that has both.
-    api::timestamp_type new_row_ts; // only set if has_new_row
+    row_marker new_row_rm; // only set if has_new_row
     if (has_new_row) {
         // Note:
         // 1. By reaching here we know that updatable_view_key_cols has at
@@ -1392,7 +1398,7 @@ void view_updates::generate_update(
         //    may be two).
         // 2. Because has_new_row, we know all elements in that array have
         //    after.has_value() true, so we can use after.get_ts().
-        new_row_ts = updatable_view_key_cols[0].after.get_ts();
+        api::timestamp_type new_row_ts = updatable_view_key_cols[0].after.get_ts();
         if (updatable_view_key_cols.size() > 1) {
             // This is the Alternator-only support for two regular base
             // columns that become view key columns. See explanation in
@@ -1405,6 +1411,12 @@ void view_updates::generate_update(
             }
         }
         vlogger.warn("NYH generate_update new_row_ts = {}", new_row_ts);
+        // We assume that either updatable_view_key_cols has just one column
+        // (the only situation allowed in CQL) or if there is more then one
+        // they have the same expiry information (in Alternator, there is
+        // never a CQL TTL set).
+        // CONTINUE HERE: we need updatable_view_key_cols[0] to also cary the ttl() and expiry()! I.e., regular_column_transformation::result needs to contain ttl() and expiry()...
+        new_row_rm =  row_marker(new_row_ts, updatable_view_key_cols[0].after.get_ttl(), updatable_view_key_cols[0].after.get_expiry());
     }
 
     if (has_old_row) {
@@ -1442,7 +1454,7 @@ void view_updates::generate_update(
         vlogger.warn("NYH generate_update old_row_ts = {}", old_row_ts);
         if (has_new_row) {
             if (same_row) {
-                update_entry(db, base_key, update, *existing, now, new_row_ts);
+                update_entry(db, base_key, update, *existing, now, new_row_rm);
                 for(auto&x : _updates) { vlogger.warn("NYH generate_update after update_entry, pk={} partition={}", x.first, mutation_partition::printer(*_view, x.second)); }
             } else {
                 // This code doesn't work if the old and new view row have the
@@ -1454,7 +1466,7 @@ void view_updates::generate_update(
                 // need to pass the ts.
                 delete_old_entry(db, base_key, *existing, update, now, old_row_ts);
                 for(auto&x : _updates) { vlogger.warn("NYH generate_update delete_old_entry B, pk={} partition={}", x.first, mutation_partition::printer(*_view, x.second)); }
-                create_entry(db, base_key, update, now, new_row_ts);
+                create_entry(db, base_key, update, now, new_row_rm);
                 for(auto&x : _updates) { vlogger.warn("NYH generate_update after also create_entry B, pk={} partition={}", x.first, mutation_partition::printer(*_view, x.second)); }
             }
         } else {
@@ -1462,7 +1474,7 @@ void view_updates::generate_update(
             for(auto&x : _updates) { vlogger.warn("NYH generate_update after delete_old_entry, pk={} partition={}", x.first, mutation_partition::printer(*_view, x.second)); }
         }
     } else if (has_new_row) {
-        create_entry(db, base_key, update, now, new_row_ts);
+        create_entry(db, base_key, update, now, new_row_rm);
         for(auto&x : _updates) { vlogger.warn("NYH generate_update after create_entry, pk={} partition={}", x.first, mutation_partition::printer(*_view, x.second)); }
     }
 

@@ -128,16 +128,23 @@ public:
         bool _deleted; // if _deleted, "value" is unset
         // timestamp of live or deleted value. If !_deleted && !_value,
         // ts is undefined.
+        // NYH TODO: consider using a row_marker instead of the following triplet and another copy of those constants?
         api::timestamp_type _ts;
+        gc_clock::duration _ttl;
+        gc_clock::time_point _expiry;
+        static constexpr gc_clock::duration no_ttl { 0 };
+        static constexpr gc_clock::time_point no_expiry { gc_clock::duration(0) };
 
+        // NYH TODO: did I actually use deleted_value anywhere? I don't remember I did...
         static result deleted_value(api::timestamp_type ts) {
             return result{std::nullopt, true, ts};
         }
         static result missing_value() {
             return result{std::nullopt, false, 0};
         }
-        static result value(std::optional<bytes>&& v, api::timestamp_type ts) {
-            return result{std::move(v), false, ts};
+        // set ttl and expiry to no_ttl, expiry if there are none.
+        static result value(std::optional<bytes>&& v, api::timestamp_type ts, gc_clock::duration ttl, gc_clock::time_point expiry) {
+            return result{std::move(v), false, ts, ttl, expiry};
         }
         bool has_value() const {
             return _value.has_value();
@@ -155,6 +162,12 @@ public:
         // Should only be called if has_value() or is_deleted() (i.e., !is_missing())
         api::timestamp_type get_ts() const {
             return _ts;
+        }
+        gc_clock::duration get_ttl() const {
+            return _ttl;
+        }
+        gc_clock::time_point get_expiry() const {
+            return _expiry;
         }
     };
     virtual ~regular_column_transformation() = default;

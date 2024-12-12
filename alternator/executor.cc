@@ -1193,7 +1193,9 @@ regular_column_transformation::result extract_from_attrs_column_computation::com
                     elogger.warn("NYH compute_value alive {} = {}", _attr_name, atomic_cell_view::printer(*bytes_type, cell));
                     return regular_column_transformation::result::value(
                         serialized_value_if_type(to_bytes(cell.value()), _desired_type),
-                        cell.timestamp());
+                        cell.timestamp(),
+                        cell.is_live_and_has_ttl() ? cell.ttl() : regular_column_transformation::result::no_ttl,
+                        cell.is_live_and_has_ttl() ? cell.expiry() : regular_column_transformation::result::no_expiry);
                 } else {
                     elogger.warn("NYH compute_value deleted {} = {}", _attr_name, atomic_cell_view::printer(*bytes_type, cell));
                     return regular_column_transformation::result::deleted_value(cell.timestamp());
