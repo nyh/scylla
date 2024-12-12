@@ -657,11 +657,6 @@ def test_updatetable_delete_missing_gsi(dynamodb, table1):
             GlobalSecondaryIndexUpdates=[{  'Delete':
                 { 'IndexName': 'nonexistent' } }])
 
-
-# NYH TODO: write a LSI+GSI test where column x must be a real column because
-# it is a LSI key, and x,y is a GSI key (two base regular columns!), so
-# adding/deleting x,y (see scenarios in test_gsi_3_long) will need to
-# add/delete columns.
 # TODO: when UpdateTable creates a GSI the different columns are created in separate code so we need to check the result actually works and has all the columns. Write a test that also has an LSI (which forces some other column to become a real column) and also write additional cells to :attrs, and see all of this is writable/readable with the new GSI.
 # NYH CONTINUE: think if we need has_base_non_pk_columns_in_view_pk
 #  and if it's fine or not we don't set it.
@@ -673,3 +668,12 @@ def test_updatetable_delete_missing_gsi(dynamodb, table1):
 # a bug with that).
 # NYH TODO: do we have tests for GSI with different types of keys, not
 # just string? The serialization code is new and needs to be exercises.
+
+# NYH CONTINUE HERE:
+# In test_gsi_3_long() in test_gsi.py, we exercised the case where a GSI has
+# two non-base-key attributes, and both were map attributes. Create a 
+# parameterized version of this test which uses 4 schemas (no point in
+# fixture, just create it for each parameter...) where:
+#   1. In the base table also add a range key c
+#   2. In each case add one or two LSIs which force either "a" or "b"
+#      or both to become a real column in the Scylla table.
