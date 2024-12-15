@@ -721,10 +721,21 @@ def test_rbac_updatetable_gsi(dynamodb, cql):
                 wait_for_gsi(tab, 'hello')
                 # Without ALTER permissions, UpdateTable GSI Delete won't work.
                 # Note that the GSI Delete operation checks for the existence
-                # of the GSI before checking the permissions, so we need to
-                # test this when the GSI actually exists.
+                # of the GSI before checking the permissions, so we needed to
+                # test deletion on a GSI that actually exists.
+                # However, there's an extra complication here: We can't jus
+                # use unauthorized(). That retries the operation several times
+                # until it's unauthorized. But if the first deletion was
+                # authorized (because the permissions were still cached) the
+                # GSI will be gone and the second attempt will fail on
+                # ResourceNotFoundException instead of unauthorized. So we
+                # try a different UpdateTable operation (a silly BillingMode
+                # setting) first, wait until what's unauthorized, and then
+                # verify the actual deletion is unauthorized.
                 unauthorized(lambda: tab.meta.client.update_table(TableName=tab.name,
-                    **delete_gsi))
+                    BillingMode='PAY_PER_REQUEST'))
+                with pytest.raises(ClientError, match='AccessDeniedException'):
+                    tab.meta.client.update_table(TableName=tab.name, **delete_gsi)
                 # With ALTER permissions, it works.
                 with temporary_grant(cql, 'ALTER', cql_table_name(tab), role):
                     authorized(lambda: tab.meta.client.update_table(TableName=tab.name,
