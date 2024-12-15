@@ -636,7 +636,6 @@ public:
 
     using vector_type = utils::small_vector<view_managed_key_view_and_action, 1>;
     vector_type operator()(const column_definition& cdef) {
-        vlogger.warn("NYH getter operator() {}", cdef.name_as_text());
         column_position++;
 
         // Note that in the following lines, if the key column exists in the
@@ -673,7 +672,6 @@ public:
 
 private:
     vector_type handle_computed_column(const column_definition& cdef) {
-        vlogger.warn("NYH handle_computed_column {}", cdef.name_as_text());
         if (!cdef.is_computed()) {
             throw std::logic_error{format(
                 "Detected legacy non-computed token column {} in view for table {}.{}",
@@ -696,7 +694,7 @@ private:
             //regular_column_transformation::result before = _existing ? 
             //    c->compute_value(_base, _base_key, *_existing) : regular_column_transformation::result::missing_value();
             if (after.has_value()) {
-                    vlogger.warn("NYH {} handle_computed_column case after.has_value {}", cdef.name_as_text(), after.get_value());
+
                 return {managed_bytes_view(linearized_values.emplace_back(after.get_value()))};
             }
             if (_existing) {
@@ -744,8 +742,6 @@ view_updates::get_view_rows(const partition_key& base_key, const clustering_or_s
 
     std::vector<value_getter::vector_type> pk_elems, ck_elems;
     std::ranges::copy(_view->partition_key_columns() | get_value, std::back_inserter(pk_elems));
-    vlogger.warn("NYH get_view_rows {} partition key columns, {} pk_elems", _view->partition_key_columns().size(), pk_elems.size());
-    for (auto &x : pk_elems) { for(auto&y : x) { vlogger.warn("NYH get_view_rows pk_elem mkva {}", y._key_view); }}
     // If no collection column was found, each of the actions will contain no_action,
     // in particular, it does not harm to use column 0.
     const bool had_multiple_values_in_pk = bool(getter.collection_column_position);
@@ -761,14 +757,12 @@ view_updates::get_view_rows(const partition_key& base_key, const clustering_or_s
         partition_key pkey = partition_key::from_range(boost::adaptors::transform(pk, view_managed_key_view_and_action::get_key_view));
         clustering_key ckey = clustering_key::from_range(boost::adaptors::transform(ck, view_managed_key_view_and_action::get_key_view));
         auto action = (action_column < pk.size() ? pk[action_column] : ck[action_column - pk.size()])._action;
-        vlogger.warn("NYH get_view_rows compute_row pkey={}, ckey={}", pkey, ckey);
         mutation_partition& partition = partition_for(std::move(pkey));
 
         // Skip adding the row if we already wrote a partition tombstone for this partition, and the update
         // is deleting the row with an equal row tombstone. This means the entire partition is deleted
         // so we don't need to generate updates for individual rows.
         if (partition.partition_tombstone() && partition.partition_tombstone() == row_delete_tomb.tomb()) {
-            vlogger.warn("NYH get_view_rows early return");
             return;
         }
         ret.push_back({&partition.clustered_row(*_view, std::move(ckey)), action});
@@ -816,7 +810,6 @@ view_updates::get_view_rows(const partition_key& base_key, const clustering_or_s
     } else {
         // Here it's the old regular index over regular values. Each vector has just one element.
         auto get_front = boost::adaptors::transformed([](const auto& v) { return v.front(); });
-        vlogger.warn("NYH get_view_rows good old case");
         compute_row(pk_elems | get_front, ck_elems | get_front);
     }
 
@@ -979,7 +972,6 @@ static void add_cells_to_view(const schema& base, const schema& view, column_kin
  * This method checks that the base row does match the view filter before applying anything.
  */
 void view_updates::create_entry(data_dictionary::database db, const partition_key& base_key, const clustering_or_static_row& update, gc_clock::time_point now, row_marker rm) {
-    vlogger.warn("NYH create_entry update clustering={}", update.is_clustering_row());
     if (!matches_view_filter(db, *_base, _view_info, base_key, update, now)) {
         return;
     }
@@ -1006,7 +998,6 @@ void view_updates::create_entry(data_dictionary::database db, const partition_ke
  * This method checks that the base row does match the view filter before bothering.
  */
 void view_updates::delete_old_entry(data_dictionary::database db, const partition_key& base_key, const clustering_or_static_row& existing, const clustering_or_static_row& update, gc_clock::time_point now, api::timestamp_type deletion_ts) {
-    vlogger.warn("NYH delete_old_entry");
     // Before deleting an old entry, make sure it was matching the view filter
     // (otherwise there is nothing to delete)
     if (matches_view_filter(db, *_base, _view_info, base_key, existing, now)) {
@@ -1015,32 +1006,26 @@ void view_updates::delete_old_entry(data_dictionary::database db, const partitio
 }
 
 void view_updates::do_delete_old_entry(const partition_key& base_key, const clustering_or_static_row& existing, const clustering_or_static_row& update, gc_clock::time_point now, api::timestamp_type deletion_ts) {
-    vlogger.warn("NYH do_delete_old_entry {}", existing.is_clustering_row());
     auto view_rows = get_view_rows(base_key, existing, std::nullopt, update.tomb());
     const auto kind = existing.column_kind();
     for (const auto& [r, action] : view_rows) {
-        vlogger.warn("NYH do_delete_old_entry row {} ts {}", deletable_row::printer(*_view,*r), deletion_ts);
         const auto& col_ids = existing.is_clustering_row()
                 ? _base_info->base_regular_columns_in_view_pk()
                 : _base_info->base_static_columns_in_view_pk();
         if (_view_info.has_computed_column_depending_on_base_non_primary_key()) {
             if (auto ts_tag = std::get_if<view_key_and_action::shadowable_tombstone_tag>(&action)) {
-                vlogger.warn("NYH do_delete_old_entry case A1");
                 r->apply(ts_tag->into_shadowable_tombstone(now));
             } else {
                 // NYH: The above if() is only implemented for the collection
                 // column indexing, and it generates the deletion timestamp
                 // in an elaborate per-row mannger. In other cases, only one
                 // row is involved and the caller gives us deletion_ts to use.
-                vlogger.warn("NYH do_delete_old_entry case A2");
                 if (deletion_ts == api::missing_timestamp) {
                     utils::on_internal_error("NYH do_delete_old_entry unexpected missing timestamp");
                 }
                 r->apply(shadowable_tombstone(deletion_ts, now));
-                vlogger.warn("NYH do_delete_old_entry case A2 after apply {}", deletable_row::printer(*_view,*r));
             }
         } else if (!col_ids.empty()) {
-            vlogger.warn("NYH do_delete_old_entry case B");
             // We delete the old row using a shadowable row tombstone, making sure that
             // the tombstone deletes everything in the row (or it might still show up).
             // Note: multi-cell columns can't be part of the primary key.
@@ -1158,26 +1143,21 @@ bool view_updates::can_skip_view_updates(const clustering_or_static_row& update,
  * applying anything.
  */
 void view_updates::update_entry(data_dictionary::database db, const partition_key& base_key, const clustering_or_static_row& update, const clustering_or_static_row& existing, gc_clock::time_point now, row_marker rm) {
-    vlogger.warn("NYH update_entry rm={}", rm);
     // While we know update and existing correspond to the same view entry,
     // they may not match the view filter.
     if (!matches_view_filter(db, *_base, _view_info, base_key, existing, now)) {
-        vlogger.warn("NYH update_entry create_entry case {}", rm);
         create_entry(db, base_key, update, now, rm);
         return;
     }
     if (!matches_view_filter(db, *_base, _view_info, base_key, update, now)) {
-        vlogger.warn("NYH update_entry do_delete_old_entry case {}", rm);
         do_delete_old_entry(base_key, existing, update, now, rm.timestamp());
         return;
     }
 
     if (can_skip_view_updates(update, existing)) {
-        vlogger.warn("NYH update_entry skip case {}", rm);
         return;
     }
 
-    vlogger.warn("NYH update_entry general case {}", rm);
     auto view_rows = get_view_rows(base_key, update, std::nullopt, {});
     // NYH: we should get the timestamp from the caller, but I'm not sure if I fixed all the callers so let's allow missing timestamp and call compute_row_marker
     // NYH TODO: need to get not just ts but also ttl and expiry.... :-( This code probably won't work when there is ttl and expiry (it doesn't happen in Alternator, but still...)
@@ -1226,7 +1206,6 @@ void view_updates::generate_update(
         const clustering_or_static_row& update,
         const std::optional<clustering_or_static_row>& existing,
         gc_clock::time_point now) {
-    vlogger.warn("NYH generate_update() update.clustering={} view {}", update.is_clustering_row(), _view->cf_name());
     // "update" always includes the *base* table's key columns (but possibly
     // not the view's additional key columns if there's any) because an update
     // to the base table needs to specify its keep. However, supposedly in a
@@ -1243,7 +1222,6 @@ void view_updates::generate_update(
     // and require just modifying one view row.
     if (!_base_info->has_base_non_pk_columns_in_view_pk &&
         !_view_info.has_computed_column_depending_on_base_non_primary_key()) {
-        vlogger.warn("NYH got to same-view-key case");
         if (update.is_static_row()) {
             // TODO: support static rows in views with pk only including columns from base pk
             return;
@@ -1260,7 +1238,6 @@ void view_updates::generate_update(
         }
         return;
     }
-    vlogger.warn("NYH got to new-view-key-column case");
 
     // Find the view key columns that may have been changed by the update.
     // This case is interesting because a change to the view key means
@@ -1312,7 +1289,6 @@ void view_updates::generate_update(
             // we know it can't possibly update a regular column (and vice
             // versa).
             if (base_col->kind == update.column_kind()) {
-                vlogger.warn("NYH found updatatable view key column: {}", base_col->name_as_text());
                 // This is view key, so we know it is atomic
                 // TODO: according to the old code, it seems that if the update is a
                 // regular row we only need to look at the regular columns in the base,
@@ -1385,7 +1361,6 @@ void view_updates::generate_update(
             }
         }
     }
-    vlogger.warn("NYH generate_update has_old_row={}, has_new_row={}, same_row={}", has_old_row, has_new_row, same_row);
 
     // Calculate new_row_ts, only if has_new_row. This is the logic that used
     // to be in compute_row_marker() and is no longer used.
@@ -1410,7 +1385,6 @@ void view_updates::generate_update(
                 utils::on_internal_error(format("Unexpected updatable_view_key_col length {}", updatable_view_key_cols.size()));
             }
         }
-        vlogger.warn("NYH generate_update new_row_ts = {}", new_row_ts);
         // We assume that either updatable_view_key_cols has just one column
         // (the only situation allowed in CQL) or if there is more then one
         // they have the same expiry information (in Alternator, there is
@@ -1438,8 +1412,6 @@ void view_updates::generate_update(
         // 2. Because has_old_row, we know all elements in that array have
         //    before.has_value() true, so we can use before.get_ts().
         auto old_row_ts = updatable_view_key_cols[0].before.get_ts();
-        // NYH TRY...
-        //old_row_ts+=10000000; // THIS HELPS test_update_gsi_pk past line 400, WHY? NYH CONTINUE HERE!!!
         if (updatable_view_key_cols.size() > 1) {
             // This is the Alternator-only support for two regular base
             // columns that become view key columns. See explanation in
@@ -1451,11 +1423,9 @@ void view_updates::generate_update(
                 utils::on_internal_error(format("Unexpected updatable_view_key_col length {}", updatable_view_key_cols.size()));
             }
         }
-        vlogger.warn("NYH generate_update old_row_ts = {}", old_row_ts);
         if (has_new_row) {
             if (same_row) {
                 update_entry(db, base_key, update, *existing, now, new_row_rm);
-                for(auto&x : _updates) { vlogger.warn("NYH generate_update after update_entry, pk={} partition={}", x.first, mutation_partition::printer(*_view, x.second)); }
             } else {
                 // This code doesn't work if the old and new view row have the
                 // same key, because if they do we get both data and tombstone
@@ -1465,180 +1435,16 @@ void view_updates::generate_update(
                 // NYH: until we pass the entire updatable_view_key_cols we
                 // need to pass the ts.
                 delete_old_entry(db, base_key, *existing, update, now, old_row_ts);
-                for(auto&x : _updates) { vlogger.warn("NYH generate_update delete_old_entry B, pk={} partition={}", x.first, mutation_partition::printer(*_view, x.second)); }
                 create_entry(db, base_key, update, now, new_row_rm);
-                for(auto&x : _updates) { vlogger.warn("NYH generate_update after also create_entry B, pk={} partition={}", x.first, mutation_partition::printer(*_view, x.second)); }
             }
         } else {
             delete_old_entry(db, base_key, *existing, update, now, old_row_ts);
-            for(auto&x : _updates) { vlogger.warn("NYH generate_update after delete_old_entry, pk={} partition={}", x.first, mutation_partition::printer(*_view, x.second)); }
         }
     } else if (has_new_row) {
         create_entry(db, base_key, update, now, new_row_rm);
-        for(auto&x : _updates) { vlogger.warn("NYH generate_update after create_entry, pk={} partition={}", x.first, mutation_partition::printer(*_view, x.second)); }
     }
 
 }
-#if 0
-void view_updates::generate_update(
-        data_dictionary::database db,
-        const partition_key& base_key,
-        const clustering_or_static_row& update,
-        const std::optional<clustering_or_static_row>& existing,
-        gc_clock::time_point now) {
-
-    // Note that the base PK columns in update and existing are the same, since we're intrinsically dealing
-    // with the same base row. So we have to check 3 things:
-    //   1) that the clustering key doesn't have a null, which can happen for compact tables. If that's the case,
-    //      there is no corresponding entries.
-    //   2) if there is a column not part of the base PK in the view PK, whether it is changed by the update.
-    //   3) whether the update actually matches the view SELECT filter
-
-    if (update.is_clustering_row()) {
-        if (!update.key()->is_full(*_base)) {
-            return;
-        }
-    }
-
-    // NYH TODO: Because regular_column_transformation doesn't set
-    // has_base_non_pk_columns_in_view_pk we made it return true for
-    // depends_on_non_primary_key_column and now we reach this if.
-    // But the code we run for this if appears to have been designed
-    // just for collection column indexing and can't work for our new
-    // need of GSI indexing. This code seems to bypass all the important
-    // before-and-after code we have below.
-    if (_view_info.has_computed_column_depending_on_base_non_primary_key()) {
-        vlogger.warn("NYH calling update_entry_for_computed_column");
-        return update_entry_for_computed_column(base_key, update, existing, now);
-    }
-    // NYH CONTINUE HERE: calculate here view_key_existing and view_key_update
-    // which is the view row's key in existing and in update. Then use it in all
-    // code below instead of repeating it in a hacky way in has_old_row, has_new_row,
-    // *_entry(), get_view_rows(), and so on.
-    // If one of the view key columns is a regular_column_transformation (perhaps
-    // pre-compute as if in has_computed_* above) we use the computed column to
-    // calculate it, otherwise we copy it from the base (like we do in code below). 
-    // Modify all the code below (*_entry(), get_view_rows(), etc.) to take
-    // the view_keys_* separately instead of recalculating it all the time. 
-    // The has_old_row, has_new_row, and so on, will be based on checking if any of the
-    // view key columns is listed as deleted/missing appropriately (e.g., deleted in
-    // the update, or deleted in the existing and missing in the update).
-    // We also need the before-and-after key to be able to compare if it's the same key
-    // (maybe if there are missing values in update we need to copy them from existing)
-    //
-    // The !_base_info->has_base_non_pk_columns_in_view_pk case is simpler - the
-    // view key is the same for existing and update and there are no computed columns,
-    // so perhaps we don't need to modify it at all.
-    //
-    // NYH TODO: if the update didn't change a column, is it missing in "update" or
-    // copied from "existing"? Is this also true for a map - is the whole map
-    // copied or just the changed attribute? We need to verify we have tests for
-    // this (updates that change some attribute which is not the view key).
-
-
-    if (!_base_info->has_base_non_pk_columns_in_view_pk) {
-        // NYH CONTINUE HERE: test_gsi.py::test_gsi_2
-        // We reach this case even though we have a computed column based
-        // on a non-pk column. Perhaps if there are any regular_column_transformation
-        // computed columns, we need to set this boolean to true!!
-        vlogger.warn("NYH got to same-view-key case");
-        if (update.is_static_row()) {
-            // TODO: support static rows in views with pk only including columns from base pk
-            return;
-        }
-        // The view key is necessarily the same pre and post update.
-        if (existing && existing->is_live(*_base)) {
-            if (update.is_live(*_base)) {
-                update_entry(db, base_key, update, *existing, now);
-            } else {
-                delete_old_entry(db, base_key, *existing, update, now);
-            }
-        } else if (update.is_live(*_base)) {
-            create_entry(db, base_key, update, now);
-        }
-        return;
-    }
-
-    vlogger.warn("NYH got to new-view-key-column case");
-    // NYH TODO: calculate the before and after view key once,
-    // here, to avoid doing it in get_rows() (which calls the computed column)
-    // inside the different *_entry functions. BUT, how will collection indexing
-    // continue to work?
-    // Maybe we should add the row to the ordinary computed column, otherwise
-    // when executing the computed column we need to check if it's a base
-    // computed column or a regular_column_transformation.
-
-    const auto& col_ids = update.is_clustering_row()
-            ? _base_info->base_regular_columns_in_view_pk()
-            : _base_info->base_static_columns_in_view_pk();
-
-    // The view has a non-primary-key column from the base table as its primary key.
-    // That means it's either a regular or static column. If we are currently
-    // processing an update which does not correspond to the column's kind,
-    // just stop here.
-    if (col_ids.empty()) {
-        return;
-    }
-
-    const auto kind = update.column_kind();
-
-    // If one of the key columns is missing, set has_new_row = false
-    // meaning that after the update there will be no view row.
-    // If one of the key columns is missing in the existing value,
-    // set has_old_row = false meaning we don't have an old row to
-    // delete.
-    bool has_old_row = true;
-    bool has_new_row = true;
-    bool same_row = true;
-    for (auto col_id : col_ids) {
-        auto* after = update.cells().find_cell(col_id);
-        auto& cdef = _base->column_at(kind, col_id);
-        if (existing) {
-            auto* before = existing->cells().find_cell(col_id);
-            // Note that this cell is necessarily atomic, because col_ids are
-            // view key columns, and keys must be atomic.
-            if (before && before->as_atomic_cell(cdef).is_live()) {
-                if (after && after->as_atomic_cell(cdef).is_live()) {
-                    // We need to compare just the values of the keys, not
-                    // metadata like the timestamp. This is because below,
-                    // if the old and new view row have the same key, we need
-                    // to be sure to reach the update_entry() case.
-                    auto cmp = compare_unsigned(before->as_atomic_cell(cdef).value(), after->as_atomic_cell(cdef).value());
-                    if (cmp != 0) {
-                        same_row = false;
-                    }
-                }
-            } else {
-                has_old_row = false;
-            }
-        } else {
-            has_old_row = false;
-        }
-        if (!after || !after->as_atomic_cell(cdef).is_live()) {
-            has_new_row = false;
-        }
-    }
-    if (has_old_row) {
-        if (has_new_row) {
-            if (same_row) {
-                update_entry(db, base_key, update, *existing, now);
-            } else {
-                // This code doesn't work if the old and new view row have the
-                // same key, because if they do we get both data and tombstone
-                // for the same timestamp (now) and the tombstone wins. This
-                // is why we need the "same_row" case above - it's not just a
-                // performance optimization.
-                delete_old_entry(db, base_key, *existing, update, now);
-                create_entry(db, base_key, update, now);
-            }
-        } else {
-            delete_old_entry(db, base_key, *existing, update, now);
-        }
-    } else if (has_new_row) {
-        create_entry(db, base_key, update, now);
-    }
-}
-#endif
 
 bool view_updates::is_partition_key_permutation_of_base_partition_key() const {
     return _view_info.is_partition_key_permutation_of_base_partition_key();
@@ -1689,7 +1495,6 @@ bool view_updates::generate_partition_tombstone_update(
         return false;
     }
 
-    vlogger.warn("NYH generate_partition_tombstone_update applying partition tombstone to view update");
     // Apply the partition tombstone on the view partition
     mutation_partition& mp = partition_for(std::move(*view_key_opt));
     mp.apply(partition_tomb);
@@ -1785,7 +1590,6 @@ future<std::optional<utils::chunked_vector<frozen_mutation_and_schema>>> view_up
 }
 
 void view_update_builder::generate_update(clustering_row&& update, std::optional<clustering_row>&& existing) {
-    vlogger.warn("NYH view_update_builder::generate_update clustering {}", clustering_row::printer(*_base.schema(), update));
     if (update.empty()) {
         // An empty update row (no cells and no tombstone) is rare, but it is
         // possible (see #15228): A mutation can modify a column that was
@@ -1819,7 +1623,6 @@ void view_update_builder::generate_update(clustering_row&& update, std::optional
 
 void view_update_builder::generate_update(static_row&& update, const tombstone& update_tomb,
         std::optional<static_row>&& existing, const tombstone& existing_tomb) {
-    vlogger.warn("NYH view_update_builder::generate_update static {}", static_row::printer(*_base.schema(), update));
     if (!update_tomb && update.empty()) {
         throw std::logic_error("A materialized view update cannot be empty");
     }
