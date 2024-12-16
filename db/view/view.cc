@@ -41,6 +41,7 @@
 #include "db/view/view_builder.hh"
 #include "db/view/view_updating_consumer.hh"
 #include "db/view/view_update_generator.hh"
+#include "db/view/regular_column_transformation.hh"
 #include "db/system_keyspace_view_types.hh"
 #include "db/system_keyspace.hh"
 #include "db/system_distributed_keyspace.hh"
@@ -1263,7 +1264,7 @@ void view_updates::generate_update(
                 // the base key, so it may change in the update.
                 if (auto* c = dynamic_cast<const regular_column_transformation*>(&computation)) {
                     updatable_view_key_cols.emplace_back(view_col.id,
-                        existing ? c->compute_value(*_base, base_key, *existing) : regular_column_transformation::result::missing_value(),
+                        existing ? c->compute_value(*_base, base_key, *existing) : regular_column_transformation::result(),
                         c->compute_value(*_base, base_key, update));
                 } else {
                     // We assume this a collection_column_computation used
@@ -1308,25 +1309,8 @@ void view_updates::generate_update(
                     }
                 }
                 updatable_view_key_cols.emplace_back(view_col.id,
-                    before ? (
-                        // NYH TODO: this constructor is super ugly. We should have a constructor that takes an
-                        // atomic_cell_view and does the right construction!
-                        before->is_live() ?
-                            regular_column_transformation::result::value(to_bytes(before->value()), before->timestamp(),
-                                before->is_live_and_has_ttl() ? before->ttl() : regular_column_transformation::result::no_ttl,
-                                before->is_live_and_has_ttl() ? before->expiry() : regular_column_transformation::result::no_expiry) :
-                            regular_column_transformation::result::deleted_value(before->timestamp())
-                        ) :
-                        regular_column_transformation::result::missing_value(),
-                    after ? (
-                        after->is_live() ?
-                            regular_column_transformation::result::value(to_bytes(after->value()), after->timestamp(),
-                                after->is_live_and_has_ttl() ? after->ttl() : regular_column_transformation::result::no_ttl,
-                                after->is_live_and_has_ttl() ? after->expiry() : regular_column_transformation::result::no_expiry) :
-                            regular_column_transformation::result::deleted_value(after->timestamp())
-                        ) :
-                        regular_column_transformation::result::missing_value()
-                    );
+                    before ? regular_column_transformation::result(*before) : regular_column_transformation::result(),
+                    after ? regular_column_transformation::result(*after) : regular_column_transformation::result());
             }
         }
     }

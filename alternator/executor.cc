@@ -1127,6 +1127,10 @@ static std::unordered_set<std::string> validate_attribute_definitions(const rjso
     return seen_attribute_names;
 }
 
+// The following "extract_from_attrs_column_computation" implementation is
+// what allows Alternator GSIs to use in a materialized view's key a member
+// from the ":attrs" map instead of a real column in the schema:
+
 const bytes extract_from_attrs_column_computation::MAP_NAME = executor::ATTRS_COLUMN_NAME;
 
 column_computation_ptr extract_from_attrs_column_computation::clone() const {
@@ -1146,9 +1150,9 @@ bytes extract_from_attrs_column_computation::serialize() const {
 
 // Construct a extract_from_attrs_column_computation object based on the
 // saved output of serialize(). Calls on_internal_error() if the string
-// doesn't match the output format of serialize(). "type" is not checked -
-// we assume the caller (column_computation::deserialize()) won't call this
-// constructor if "type" doesn't match.
+// doesn't match the expected output format of serialize(). "type" is not
+// checked - we assume the caller (column_computation::deserialize()) won't
+// call this constructor if "type" doesn't match.
 extract_from_attrs_column_computation::extract_from_attrs_column_computation(const rjson::value &v) {
     const rjson::value* attr_name = rjson::find(v, "attr_name");
     if (attr_name->IsString()) {
@@ -1183,24 +1187,17 @@ regular_column_transformation::result extract_from_attrs_column_computation::com
     // Look for the desired attribute _attr_name in the attrs_col map in row:
     const atomic_cell_or_collection* attrs = row.cells().find_cell(attrs_col->id);
     if (!attrs) {
-        return regular_column_transformation::result::missing_value();
+        return regular_column_transformation::result();
     }
     collection_mutation_view cmv = attrs->as_collection_mutation();
     return cmv.with_deserialized(*attrs_col->type, [this] (const collection_mutation_view_description& cmvd) {
         for (auto&& [key, cell] : cmvd.cells) {
             if (utf8_type->to_string(key) == _attr_name) {
-                if (cell.is_live()) {
-                    return regular_column_transformation::result::value(
-                        serialized_value_if_type(to_bytes(cell.value()), _desired_type),
-                        cell.timestamp(),
-                        cell.is_live_and_has_ttl() ? cell.ttl() : regular_column_transformation::result::no_ttl,
-                        cell.is_live_and_has_ttl() ? cell.expiry() : regular_column_transformation::result::no_expiry);
-                } else {
-                    return regular_column_transformation::result::deleted_value(cell.timestamp());
-                }
+                return regular_column_transformation::result(cell,
+                    std::bind(serialized_value_if_type, std::placeholders::_1, _desired_type));
             }
         }
-        return regular_column_transformation::result::missing_value();
+        return regular_column_transformation::result();
     });
 }
 
