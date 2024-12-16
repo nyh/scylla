@@ -8,6 +8,7 @@
 
 #include <fmt/ranges.h>
 #include <seastar/core/sleep.hh>
+#include <seastar/core/on_internal_error.hh>
 #include "alternator/executor.hh"
 #include "auth/permission.hh"
 #include "auth/resource.hh"
@@ -53,8 +54,6 @@
 #include "db/schema_tables.hh"
 #include "utils/rjson.hh"
 #include "alternator/extract_from_attrs.hh"
-#include "column_computation.hh"
-#include "seastar/core/on_internal_error.hh"
 #include "types/types.hh"
 #include "db/system_keyspace.hh"
 
@@ -472,11 +471,16 @@ static rjson::value generate_arn_for_index(const schema& schema, std::string_vie
 }
 
 // The following function returns the set of fully-built views in the given
-// keyspace - we need this for describe_table() to know if a view is still
+// keyspace. We need this for describe_table() to know if a view is still
 // backfilling, or active. Sadly, currently we don't cache in memory whether
-// whether a view finished building long ago - so checking the built views
-// involves an inefficient distributed request into a system table.
-static future<std::set<std::string>> list_built_views(service::storage_proxy& proxy, std::string_view keyspace_name, service::client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit) {
+// a view finished building long ago - so checking the built views involves
+// an inefficient distributed request into a system table.
+static future<std::set<std::string>> list_built_views(
+        service::storage_proxy& proxy,
+        std::string_view keyspace_name,
+        service::client_state& client_state,
+        tracing::trace_state_ptr trace_state,
+        service_permit permit) {
     // The built_views system table has keyspace_name as the partition key,
     // and view_name as the clustering key. We scan a single partition and
     // return the list of view_name values.
@@ -485,10 +489,18 @@ static future<std::set<std::string>> list_built_views(service::storage_proxy& pr
     dht::partition_range_vector partition_ranges{dht::partition_range(dht::decorate_key(*schema, pk))};
     auto selection = cql3::selection::selection::wildcard(schema);
     auto partition_slice = query::partition_slice({query::clustering_range::make_open_ended_both_sides()}, {}, {}, selection->get_query_options());
-    auto command = ::make_lw_shared<query::read_command>(schema->id(), schema->version(), partition_slice, proxy.get_max_result_size(partition_slice), query::tombstone_limit(proxy.get_tombstone_limit()));
+    auto command = ::make_lw_shared<query::read_command>(
+        schema->id(), schema->version(), partition_slice,
+        proxy.get_max_result_size(partition_slice),
+        query::tombstone_limit(proxy.get_tombstone_limit()));
     service::storage_proxy::coordinator_query_result qr =
-        co_await proxy.query(schema, std::move(command), std::move(partition_ranges), db::consistency_level::ONE,service::storage_proxy::coordinator_query_options(executor::default_timeout(), std::move(permit), client_state, trace_state));
-    query::result_set rs = query::result_set::from_raw_result(schema, partition_slice, *qr.query_result);
+        co_await proxy.query(
+            schema, std::move(command), std::move(partition_ranges),
+            db::consistency_level::ONE,
+            service::storage_proxy::coordinator_query_options(
+                executor::default_timeout(), std::move(permit), client_state, trace_state));
+    query::result_set rs = query::result_set::from_raw_result(
+        schema, partition_slice, *qr.query_result);
     std::set<std::string> ret;
     for (auto&& r : rs.rows()) {
         std::optional<sstring> view_name = r.get<sstring>("view_name");
@@ -559,7 +571,8 @@ static future<rjson::value> fill_table_description(schema_ptr schema, table_stat
         if (!t.views().empty()) {
             rjson::value gsi_array = rjson::empty_array();
             rjson::value lsi_array = rjson::empty_array();
-            std::set<std::string> built_views = co_await list_built_views(proxy, schema->ks_name(), client_state, trace_state, permit);
+            std::set<std::string> built_views = co_await list_built_views(
+                proxy, schema->ks_name(), client_state, trace_state, permit);
             for (const view_ptr& vptr : t.views()) {
                 rjson::value view_entry = rjson::empty_object();
                 const sstring& cf_name = vptr->cf_name();
@@ -1204,7 +1217,7 @@ regular_column_transformation::result extract_from_attrs_column_computation::com
 // extract_from_attrs_column_computation needs the whole row to compute
 // value, it cann't use just the partition key.
 bytes extract_from_attrs_column_computation::compute_value(const schema&, const partition_key&) const {
-    throw std::runtime_error(fmt::format("{}: not supported", __PRETTY_FUNCTION__));
+    on_internal_error(elogger, "extract_from_attrs_column_computation::compute_value called without row");
 }
 
 
@@ -1246,11 +1259,14 @@ static future<executor::request_return_type> create_table_on_shard0(service::cli
 
     schema_ptr partial_schema = builder.build();
 
-    // Parse GlobalSecondaryIndexes parameters before creating the base
-    // table, so if we have a parse errors we can fail without creating
+    // Parse Local/GlobalSecondaryIndexes parameters before creating the
+    // base table, so if we have a parse errors we can fail without creating
     // any table.
     std::vector<schema_builder> view_builders;
     std::unordered_set<std::string> index_names;
+    // Remember the attributes used for LSI keys. Since LSI must be created
+    // with the table, we make these attributes real schema columns, and need
+    // to remember this below if the same attributes are used as GSI keys.
     std::unordered_set<std::string> lsi_range_keys;
 
     const rjson::value* lsi = rjson::find(request, "LocalSecondaryIndexes");
@@ -1309,10 +1325,6 @@ static future<executor::request_return_type> create_table_on_shard0(service::cli
             std::map<sstring, sstring> tags_map = {{db::SYNCHRONOUS_VIEW_UPDATES_TAG_KEY, "true"}};
             view_builder.add_extension(db::tags_extension::NAME, ::make_shared<db::tags_extension>(tags_map));
             view_builders.emplace_back(std::move(view_builder));
-            // Remember the attributes used for LSI keys. Since LSI must be
-            // created with the table, we make these attributes real schema
-            // columns, and need to remember this below if the same attributes
-            // are used as GSI keys.
             lsi_range_keys.emplace(view_range_key);
         }
     }
@@ -1340,7 +1352,7 @@ static future<executor::request_return_type> create_table_on_shard0(service::cli
             auto [view_hash_key, view_range_key] = parse_key_schema(g);
 
             // If an attribute is already a real column in the base table
-            // (i.e., a key attribute) or we already made into a real column
+            // (i.e., a key attribute) or we already made it a real column
             // as an LSI key above, we can use it directly as a view key.
             // Otherwise, we need to add it as a "computed column", which
             // extracts and deserializes the attribute from the ":attrs" map.
@@ -1515,7 +1527,7 @@ future<executor::request_return_type> executor::create_table(client_state& clien
     });
 }
 
-// When UpdateTable adds a GSI the type of its key columns must be specified
+// When UpdateTable adds a GSI, the type of its key columns must be specified
 // in a AttributeDefinitions. If one of these key columns are *already* key
 // columns of the base table or any of its prior GSIs or LSIs, the type
 // given in AttributeDefinitions must match the type of the existing key -
@@ -1523,8 +1535,8 @@ future<executor::request_return_type> executor::create_table(client_state& clien
 // This function checks for such conflicts. It assumes that the structure of
 // the given attribute_definitions was already validated (with
 // validate_attribute_definitions()).
-// This function should be called for the base schemas, and also all its
-// views (i.e., existing GSIs and LSIs on this table).
+// This function should be called multiple times - once for the base schema
+// and once for each of its views (existing GSIs and LSIs on this table).
  static void check_attribute_definitions_conflicts(const rjson::value& attribute_definitions, const schema& schema) {
     for (auto& def : schema.primary_key_columns()) {
         std::string def_type = type_to_string(def.type);
@@ -1605,12 +1617,10 @@ future<executor::request_return_type> executor::update_table(client_state& clien
                 co_return api_error::validation("GlobalSecondaryIndexUpdates must be an array");
             }
             if (gsi_updates->Size() > 1) {
-                // Although UpdateTable takes an array of operations could
+                // Although UpdateTable takes an array of operations and could
                 // support multiple Create and/or Delete operations in one
                 // command, DynamoDB doesn't actually allows this, and throws
                 // a LimitExceededException if this is attempted.
-                // TODO: consider diverging from DynamoDB here, and allowing
-                // more than one operation.
                 co_return api_error::limit_exceeded("GlobalSecondaryIndexUpdates only allows one index creation or deletion");
             }
             if (gsi_updates->Size() == 1) {
@@ -1686,7 +1696,6 @@ future<executor::request_return_type> executor::update_table(client_state& clien
                             "AttributeDefinitions defines spurious attributes not used by any KeySchema: {}",
                             unused_attribute_definitions));
                     }
-
                     // Base key columns which aren't part of the index's key need to
                     // be added to the view nonetheless, as (additional) clustering
                     // key(s).
@@ -3160,7 +3169,7 @@ public:
     // list of actions, we keep them in an attribute_path_map which groups
     // them by top-level attribute, and detects forbidden overlaps/conflicts.
     attribute_path_map<parsed::update_expression::action> _update_expression;
- 
+
     // Saved list of GSI keys in the table being updated, used for
     // validate_value_if_gsi_key()
     std::unordered_map<bytes, std::string> _key_attributes;
