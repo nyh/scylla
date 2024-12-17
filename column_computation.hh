@@ -10,7 +10,6 @@
 
 #include "bytes.hh"
 #include <memory>
-#include "timestamp.hh"
 
 class schema;
 class partition_key;
@@ -97,7 +96,6 @@ public:
     virtual bytes serialize() const override;
     virtual bytes compute_value(const schema& schema, const partition_key& key) const override;
 };
-
 
 /*
  * collection_column_computation is used for a secondary index on a collection
