@@ -15,7 +15,6 @@
 #include "mutation/frozen_mutation.hh"
 #include "data_dictionary/data_dictionary.hh"
 #include "locator/abstract_replication_strategy.hh"
-#include "timestamp.hh"
 
 class frozen_mutation_and_schema;
 
