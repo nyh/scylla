@@ -796,7 +796,7 @@ static void add_column(schema_builder& builder, const std::string& name, const r
                 // but rather extracts a single value from the ":attrs" map)
                 alternator_type at = type_info_from_string(type).atype;
                 builder.with_computed_column(to_bytes(name), dt, kind,
-                    std::make_unique<extract_from_attrs_column_computation>(name, at));
+                    std::make_unique<extract_from_attrs_column_computation>(to_bytes(name), at));
             } else {
                 builder.with_column(to_bytes(name), dt, kind);
             }
@@ -1156,12 +1156,12 @@ column_computation_ptr extract_from_attrs_column_computation::clone() const {
 bytes extract_from_attrs_column_computation::serialize() const {
     rjson::value ret = rjson::empty_object();
     rjson::add(ret, "type", TYPE_NAME);
-    rjson::add(ret, "attr_name", _attr_name);
+    rjson::add(ret, "attr_name", rjson::from_string(to_sstring_view(_attr_name)));
     rjson::add(ret, "desired_type", represent_type(_desired_type).ident);
     return to_bytes(rjson::print(ret));
 }
 
-// Construct a extract_from_attrs_column_computation object based on the
+// Construct an extract_from_attrs_column_computation object based on the
 // saved output of serialize(). Calls on_internal_error() if the string
 // doesn't match the expected output format of serialize(). "type" is not
 // checked - we assume the caller (column_computation::deserialize()) won't
@@ -1169,7 +1169,7 @@ bytes extract_from_attrs_column_computation::serialize() const {
 extract_from_attrs_column_computation::extract_from_attrs_column_computation(const rjson::value &v) {
     const rjson::value* attr_name = rjson::find(v, "attr_name");
     if (attr_name->IsString()) {
-        _attr_name = rjson::to_string_view(*attr_name);
+        _attr_name = bytes(to_bytes_view(rjson::to_string_view(*attr_name)));
         const rjson::value* desired_type = rjson::find(v, "desired_type");
         if (desired_type->IsString()) {
             _desired_type = type_info_from_string(rjson::to_string_view(*desired_type)).atype;
@@ -1205,7 +1205,7 @@ regular_column_transformation::result extract_from_attrs_column_computation::com
     collection_mutation_view cmv = attrs->as_collection_mutation();
     return cmv.with_deserialized(*attrs_col->type, [this] (const collection_mutation_view_description& cmvd) {
         for (auto&& [key, cell] : cmvd.cells) {
-            if (utf8_type->to_string(key) == _attr_name) {
+            if (key == _attr_name) {
                 return regular_column_transformation::result(cell,
                     std::bind(serialized_value_if_type, std::placeholders::_1, _desired_type));
             }

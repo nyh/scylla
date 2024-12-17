@@ -9,7 +9,7 @@
 #pragma once
 
 #include <string>
-#include <memory>
+#include <string_view>
 
 #include "utils/rjson.hh"
 #include "serialization.hh"
@@ -20,16 +20,16 @@ namespace alternator {
 
 // An implementation of a "column_computation" which extracts a specific
 // non-key attribute from the big map (":attrs") of all non-key attributes,
-// and deserializes it if it has the desired type. This computed column
-// will be used as a materialized-view key when the view key attribute
-// isn't a full-fledged CQL column but rather stored in ":attrs".
+// and deserializes it if it has the desired type. GSI will use this computed
+// column as a materialized-view key when the view key attribute isn't a
+// full-fledged CQL column but rather stored in ":attrs".
 class extract_from_attrs_column_computation : public regular_column_transformation {
     // The name of the CQL column name holding the attribute map. It is a
-    // constant (usually ":attrs"), so doesn't need to be specified when
-    // constructing the column computation.
+    // constant defined in executor.cc (as ":attrs"), so doesn't need
+    // to be specified when constructing the column computation.
     static const bytes MAP_NAME;
     // The top-level attribute name to extract from the ":attrs" map.
-    std::string _attr_name;
+    bytes _attr_name;
     // The type we expect for the value stored in the attribute. If the type
     // matches the expected type, it is decoded from the serialized format
     // we store in the map's values) into the raw CQL type value that we use
@@ -50,15 +50,18 @@ public:
     // Construct this object based on the previous output of serialize().
     // Calls on_internal_error() if the string doesn't match the output format
     // of serialize(). "type" is not checked column_computation::deserialize()
-    // won't call this constructor if "type" doesn't match. 
+    // won't call this constructor if "type" doesn't match.
     extract_from_attrs_column_computation(const rjson::value &v);
-    extract_from_attrs_column_computation(std::string_view attr_name, alternator_type desired_type)
+    extract_from_attrs_column_computation(bytes_view attr_name, alternator_type desired_type)
         : _attr_name(attr_name), _desired_type(desired_type)
         {}
+    // Implement regular_column_transformation's compute_value() that
+    // accepts the full row:
     result compute_value(const schema& schema, const partition_key& key,
         const db::view::clustering_or_static_row& row) const override;
-    // This class does not implement the base class's compute_value that has
-    // only a partition key.
+    // But do not implement column_computation's compute_value() that
+    // accepts only a partition key - that's not enough so our implementation
+    // of this function does on_internal_error().
     bytes compute_value(const schema& schema, const partition_key& key) const override;
     // This computed column does depend on a non-primary key column, so
     // its result may change in the update and we need to compute it
