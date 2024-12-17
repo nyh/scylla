@@ -57,7 +57,6 @@
 #include "service/migration_manager.hh"
 #include "service/storage_proxy.hh"
 #include "compaction/compaction_manager.hh"
-#include "timestamp.hh"
 #include "utils/assert.hh"
 #include "utils/small_vector.hh"
 #include "view_info.hh"
@@ -387,7 +386,7 @@ public:
         _pk = key.explode();
     }
     void accept_new_partition(uint64_t row_count) {
-        throw std::logic_error("view_filter_che-cking_visitor expects an explicit partition key");
+        throw std::logic_error("view_filter_checking_visitor expects an explicit partition key");
     }
 
     void accept_new_row(const clustering_key& key, const query::result_row_view& static_row, const query::result_row_view& row) {
@@ -513,80 +512,6 @@ size_t view_updates::op_count() const {
     return _op_count;
 }
 
-row_marker view_updates::compute_row_marker(const clustering_or_static_row& base_row) const {
-    /*
-     * We need to compute both the timestamp and expiration for view rows.
-     *
-     * Below there are several distinct cases depending on how many new key
-     * columns the view has - i.e., how many of the view's key columns were
-     * regular columns in the base. base_regular_columns_in_view_pk.size():
-     *
-     * Zero new key columns:
-     *     The view rows key is composed only from base key columns, and those
-     *     cannot be changed in an update, so the view row remains alive as
-     *     long as the base row is alive. We need to return the same row
-     *     marker as the base for the view - to keep an empty view row alive
-    *      for as long as an empty base row exists.
-     *     Note that in this case, if there are *unselected* base columns, we
-     *     may need to keep an empty view row alive even without a row marker
-     *     because the base row (which has additional columns) is still alive.
-     *     For that we have the "virtual columns" feature: In the zero new
-     *     key columns case, we put unselected columns in the view as empty
-     *     columns, to keep the view row alive.
-     *
-     * One new key column:
-     *     In this case, there is a regular base column that is part of the
-     *     view key. This regular column can be added or deleted in an update,
-     *     or its expiration be set, and those can cause the view row -
-     *     including its row marker - to need to appear or disappear as well.
-     *     So the liveness of cell of this one column determines the liveness
-     *     of the view row and the row marker that we return.
-     *
-     * Two or more new key columns:
-     *     This case is explicitly NOT supported in CQL - one cannot create a
-     *     view with more than one base-regular columns in its key. In general
-     *     picking one liveness (timestamp and expiration) is not possible
-     *     if there are multiple regular base columns in the view key, as
-     *     those can have different liveness.
-     *     However, we do allow this case for Alternator - we need to allow
-     *     the case of two (but not more) because the DynamoDB API allows
-     *     creating a GSI whose two key columns (hash and range key) were
-     *     regular columns.
-     *     We can support this case in Alternator because it doesn't use
-     *     expiration (the "TTL" it does support is different), and doesn't
-     *     support user-defined timestamps. But, the two columns can still
-     *     have different timestamps - this happens if an update modifies
-     *     just one of them. In this case the timestamp of the view update
-     *     (and that of the row marker we return) is the later of these two
-     *     updated columns.
-     */
-    // NYH CONTINUE HERE: compute_row_marker() isn't ready for the case of the computed column as the key. Can we take something like deletion_ts from the caller?
-    const auto& col_ids = base_row.is_clustering_row()
-            ? _base_info->base_regular_columns_in_view_pk()
-            : _base_info->base_static_columns_in_view_pk();
-    if (!col_ids.empty()) {
-        auto& def = _base->column_at(base_row.column_kind(), col_ids[0]);
-        // Note: multi-cell columns can't be part of the primary key.
-        auto cell = base_row.cells().cell_at(col_ids[0]).as_atomic_cell(def);
-        auto ts = cell.timestamp();
-        if (col_ids.size() > 1){
-            // As explained above, this case only happens in Alternator,
-            // and we may need to pick a higher ts:
-            auto& second_def = _base->column_at(base_row.column_kind(), col_ids[1]);
-            auto second_cell = base_row.cells().cell_at(col_ids[1]).as_atomic_cell(second_def);
-            auto second_ts = second_cell.timestamp();
-            ts = std::max(ts, second_ts);
-            // Alternator isn't supposed to have TTL or more than two col_ids!
-            if (col_ids.size() != 2 || cell.is_live_and_has_ttl() || second_cell.is_live_and_has_ttl()) [[unlikely]] {
-                utils::on_internal_error(format("Unexpected col_ids length {} or has TTL", col_ids.size()));
-            }
-        }
-        return cell.is_live_and_has_ttl() ? row_marker(ts, cell.ttl(), cell.expiry()) : row_marker(ts);
-    }
-
-    return base_row.marker();
-}
-
 namespace {
 // The following struct is identical to view_key_with_action, except the key
 // is stored as a managed_bytes_view instead of bytes.
@@ -683,35 +608,21 @@ private:
         if (auto* collection_computation = dynamic_cast<const collection_column_computation*>(&computation)) {
             return handle_collection_column_computation(collection_computation);
         }
-        // NYH: I don't know if I should do this here, what a mess :-( I don't know ifwe can convert the regular column transformation into "actions"
-        // it doesn't make sense to do it for one column if the key has multiple columns...
-        // TODO: we already calculated this computation in updatable_view_key_cols, we should pass it here and not re-compute it...
-        // HOWEVER, maybe we should support (it's not used currently!) computed columns also as non-key columns, so a computation for these columns is needed here anyway?
-        if (auto* c = dynamic_cast<const regular_column_transformation*>(&computation)) { //NYHNYH
-            //throw std::logic_error("Got to handle_computed_column() with regular_column_transformation");
+
+        // TODO: we already calculated this computation in updatable_view_key_cols,
+        // so perhaps we should pass it here and not re-compute it. But this will
+        // mean computed columns will only work for view key columns (currently
+        // we assume that anyway)
+        if (auto* c = dynamic_cast<const regular_column_transformation*>(&computation)) {
             regular_column_transformation::result after =
                 c->compute_value(_base, _base_key, _update);
-            // TODO: maybe if after is *missing* we need to read existing?
-            //regular_column_transformation::result before = _existing ? 
-            //    c->compute_value(_base, _base_key, *_existing) : regular_column_transformation::result::missing_value();
             if (after.has_value()) {
-
                 return {managed_bytes_view(linearized_values.emplace_back(after.get_value()))};
             }
-            if (_existing) {
-                throw std::logic_error("NYH I think this code is never reached?");
-                // Some code like do_delete_old_row() calls this function with
-                // empty _update meaning to calculate a key for old row
-                regular_column_transformation::result before =
-                    c->compute_value(_base, _base_key, *_existing);
-                if (before.has_value()) {
-                    vlogger.warn("NYH {} handle_computed_column case before.has_value {}", cdef.name_as_text(), before.get_value());
-                    return {managed_bytes_view(linearized_values.emplace_back(before.get_value()))};
-                }
-            }
-
-            // CONTINUE HERE, deleting old row? after.is_deleted or is_missing? probably need to use the "action" concept :-(
-            throw std::logic_error("NYH Got to else  in handle_computed_column() with regular_column_transformation");
+            // We only get to this function when we know the _update row
+            // exists and call it to read its key columns, so we don't expect
+            // to see a missing value for any of those columns
+            on_internal_error(vlogger, fmt::format("unexpected call to handle_computed_column {} missing in update", cdef.name_as_text()));
         }
 
         auto computed_value = computation.compute_value(_base, _base_key);
@@ -730,7 +641,6 @@ private:
         }
         return ret;
     }
-    
 };
 }
 
@@ -972,15 +882,12 @@ static void add_cells_to_view(const schema& base, const schema& view, column_kin
  * Creates a view entry corresponding to the provided base row.
  * This method checks that the base row does match the view filter before applying anything.
  */
-void view_updates::create_entry(data_dictionary::database db, const partition_key& base_key, const clustering_or_static_row& update, gc_clock::time_point now, row_marker rm) {
+void view_updates::create_entry(data_dictionary::database db, const partition_key& base_key, const clustering_or_static_row& update, gc_clock::time_point now, row_marker update_marker) {
     if (!matches_view_filter(db, *_base, _view_info, base_key, update, now)) {
         return;
     }
 
     auto view_rows = get_view_rows(base_key, update, std::nullopt, {});
-    // NYH: we should get the timestamp from the caller, but I'm not sure if I fixed all the callers so let's allow missing timestamp and call compute_row_marker
-    // NYH TODO (I DID IT NOW): need to get not just ts but also ttl and expiry.... :-( This code probably won't work when there is ttl and expiry (it doesn't happen in Alternator, but still...) 
-    auto update_marker = rm.is_missing() ? compute_row_marker(update) : rm;
     const auto kind = update.column_kind();
     for (const auto& [r, action]: view_rows) {
         if (auto rm = std::get_if<row_marker>(&action)) {
@@ -1017,41 +924,15 @@ void view_updates::do_delete_old_entry(const partition_key& base_key, const clus
             if (auto ts_tag = std::get_if<view_key_and_action::shadowable_tombstone_tag>(&action)) {
                 r->apply(ts_tag->into_shadowable_tombstone(now));
             } else {
-                // NYH: The above if() is only implemented for the collection
-                // column indexing, and it generates the deletion timestamp
-                // in an elaborate per-row mannger. In other cases, only one
+                // The above if() is only implemented for collection column
+                // indexing, and it generates the deletion timestamp in an
+                // elaborate per-row mannger. In other cases, only one
                 // row is involved and the caller gives us deletion_ts to use.
-                if (deletion_ts == api::missing_timestamp) {
-                    utils::on_internal_error("NYH do_delete_old_entry unexpected missing timestamp");
-                }
                 r->apply(shadowable_tombstone(deletion_ts, now));
             }
         } else if (!col_ids.empty()) {
-            // We delete the old row using a shadowable row tombstone, making sure that
-            // the tombstone deletes everything in the row (or it might still show up).
-            // Note: multi-cell columns can't be part of the primary key.
-            auto& def = _base->column_at(kind, col_ids[0]);
-            auto cell = existing.cells().cell_at(col_ids[0]).as_atomic_cell(def);
-            auto ts = cell.timestamp();
-            if (col_ids.size() > 1) {
-                // This is the Alternator-only support for two regular base
-                // columns that become view key columns. See explanation in
-                // view_updates::compute_row_marker().
-                auto& second_def = _base->column_at(kind, col_ids[1]);
-                auto second_cell = existing.cells().cell_at(col_ids[1]).as_atomic_cell(second_def);
-                auto second_ts = second_cell.timestamp();
-                ts = std::max(ts, second_ts);
-                // Alternator isn't supposed to have more than two col_ids!
-                if (col_ids.size() != 2) [[unlikely]] {
-                    utils::on_internal_error(format("Unexpected col_ids length {}", col_ids.size()));
-                }
-            }
-            if (cell.is_live()) {
-                r->apply(shadowable_tombstone(ts, now));
-            }
+            r->apply(shadowable_tombstone(deletion_ts, now));
         } else {
-            // NYH CONTINUE HERE: WHAT IS THIS CASE? AM I MISSING IT?
-            vlogger.warn("NYH do_delete_old_entry case C");
             // "update" caused the base row to have been deleted, and !col_id
             // means view row is the same - so it needs to be deleted as well
             // using the same deletion timestamps for the individual cells.
@@ -1143,15 +1024,15 @@ bool view_updates::can_skip_view_updates(const clustering_or_static_row& update,
  * This method checks that the base row (before and after) matches the view filter before
  * applying anything.
  */
-void view_updates::update_entry(data_dictionary::database db, const partition_key& base_key, const clustering_or_static_row& update, const clustering_or_static_row& existing, gc_clock::time_point now, row_marker rm) {
+void view_updates::update_entry(data_dictionary::database db, const partition_key& base_key, const clustering_or_static_row& update, const clustering_or_static_row& existing, gc_clock::time_point now, row_marker update_marker) {
     // While we know update and existing correspond to the same view entry,
     // they may not match the view filter.
     if (!matches_view_filter(db, *_base, _view_info, base_key, existing, now)) {
-        create_entry(db, base_key, update, now, rm);
+        create_entry(db, base_key, update, now, update_marker);
         return;
     }
     if (!matches_view_filter(db, *_base, _view_info, base_key, update, now)) {
-        do_delete_old_entry(base_key, existing, update, now, rm.timestamp());
+        do_delete_old_entry(base_key, existing, update, now, update_marker.timestamp());
         return;
     }
 
@@ -1160,9 +1041,6 @@ void view_updates::update_entry(data_dictionary::database db, const partition_ke
     }
 
     auto view_rows = get_view_rows(base_key, update, std::nullopt, {});
-    // NYH: we should get the timestamp from the caller, but I'm not sure if I fixed all the callers so let's allow missing timestamp and call compute_row_marker
-    // NYH TODO: need to get not just ts but also ttl and expiry.... :-( This code probably won't work when there is ttl and expiry (it doesn't happen in Alternator, but still...)
-    auto update_marker = rm.is_missing() ? compute_row_marker(update) : rm;
 
     const auto kind = update.column_kind();
     for (const auto& [r, action] : view_rows) {
@@ -1179,6 +1057,8 @@ void view_updates::update_entry(data_dictionary::database db, const partition_ke
     _op_count += view_rows.size();
 }
 
+// Note: despite the general-sounding name of this function, it is used
+// just for the case of collection indexing.
 void view_updates::update_entry_for_computed_column(
         const partition_key& base_key,
         const clustering_or_static_row& update,
@@ -1201,26 +1081,70 @@ void view_updates::update_entry_for_computed_column(
     }
 }
 
+// view_updates::generate_update() is the main function for taking an update
+// to a base table row - consisting of existing and updated versions of row -
+// and creating from it zero or more updates to a given materialized view.
+// These view updates may consist of updating an existing view row, deleting
+// an old view row, and/or creating a new view row.
+// There are several distinct cases depending on how many of the view's key
+// columns are "new key columns", i.e., were regular key columns in the base
+// or are a computed column based on a regular column (these computed columns
+// are used by, for example, Alternator's GSI):
+//
+// Zero new key columns:
+//   The view rows key is composed only from base key columns, and those can't
+//   be changed in an update, so the view row remains alive as long as the
+//   base row is alive. The row marker for the view needs to be set to the
+//   same row marker in the base - to keep an empty view row alive for as long
+//   as an empty base row exists.
+//   Note that in this case, if tere are *unselected* base columns, we may
+//   need to keep an empty view row alive even without a row marker because
+//   the base row (which has additional columns) is still alive. For that we
+//   have the "virtual columns" feature: In the zero new key columns case, we
+//   put unselected columns in the view as empty columns, to keep the view
+//   row alive.
+//
+// One new key column:
+//   In this case, there is a regular base column that is part of the view
+//   key. This regular column can be added or deleted in an update, or its
+//   expiration be set, and those can cause the view row - including its row
+//   marker - to need to appear or disappear as well. So the liveness of cell
+//   of this one column determines the liveness of the view row and the row
+//   marker that we set for it.
+//
+// Two or more new key columns:
+//   This case is explicitly NOT supported in CQL - one cannot create a view
+//   with more than one base-regular columns in its key. In general picking
+//   one liveness (timestamp and expiration) is not possible if there are
+//   multiple regular base columns in the view key, asthose can have different
+//   liveness.
+//   However, we do allow this case for Alternator - we need to allow the case
+//   of two (but not more) because the DynamoDB API allows creating a GSI
+//   whose two key columns (hash and range key) were regular columns. We can
+//   support this case in Alternator because it doesn't use expiration (the
+//   "TTL" it does support is different), and doesn't support user-defined
+//   timestamps. But, the two columns can still have different timestamps -
+//   this happens if an update modifies just one of them. In this case the
+//   timestamp of the view update (and that of the row marker) is the later
+//    of these two updated columns.
 void view_updates::generate_update(
         data_dictionary::database db,
         const partition_key& base_key,
         const clustering_or_static_row& update,
         const std::optional<clustering_or_static_row>& existing,
         gc_clock::time_point now) {
-    // "update" always includes the *base* table's key columns (but possibly
-    // not the view's additional key columns if there's any) because an update
-    // to the base table needs to specify its keep. However, supposedly in a
-    // compact-storage table an update might be missing part of the clustering
-    // key. Such an update cannot be copied to the view.
-    // FIXME: if this is a real case, refer to a test that demonstrates it. If
-    // it's not a real case, remove this if().
-    if (update.is_clustering_row() && !update.key()->is_full(*_base)) {
-        return;
+    // FIXME: The following if() is old code which may be related to COMPACT
+    // STORAGE. If this is a real case, refer to a test that demonstrates it.
+    // If it's not a real case, remove this if().
+    if (update.is_clustering_row()) {
+        if (!update.key()->is_full(*_base)) {
+            return;
+        }
     }
     // If the view key depends on any regular column in the base, the update
     // may change the view key and may require deleting an old view row and
-    // inserting a new row. The other case, which we'll handle now, is easier
-    // and require just modifying one view row.
+    // inserting a new row. The other case, which we'll handle here first,
+    // is easier and require just modifying one view row.
     if (!_base_info->has_base_non_pk_columns_in_view_pk &&
         !_view_info.has_computed_column_depending_on_base_non_primary_key()) {
         if (update.is_static_row()) {
@@ -1230,26 +1154,23 @@ void view_updates::generate_update(
         // The view key is necessarily the same pre and post update.
         if (existing && existing->is_live(*_base)) {
             if (update.is_live(*_base)) {
-                update_entry(db, base_key, update, *existing, now, row_marker());
+                update_entry(db, base_key, update, *existing, now, update.marker());
             } else {
                 delete_old_entry(db, base_key, *existing, update, now, api::missing_timestamp);
             }
         } else if (update.is_live(*_base)) {
-            create_entry(db, base_key, update, now, row_marker());
+            create_entry(db, base_key, update, now, update.marker());
         }
         return;
     }
 
-    // Find the view key columns that may have been changed by the update.
-    // This case is interesting because a change to the view key means
+    // Find the view key columns that may be changed by an update.
+    // This case is interesting because a change to the view key means that
     // we may need to delete an old view row and/or create a new view row.
     // The columns we look for are view key columns that are neither base key
-    // columns nor computed columns based just on key columns.
-    // This includes columns which were regular columns or static columns in
-    // the base table, or computed columns based on regular columns.
-    // TODO: cache this computation in _base_info like we set
-    // base_regular_columns_in_view_pk and base_static_columns_in_view_pk.
-    // Also, I don't understand all the base-view-schema-lifetime issues :-(
+    // columns nor computed columns based just on key columns. In other words,
+    // we look here for columns which were regular columns or static columns
+    // in the base table, or computed columns based on regular columns.
     struct updatable_view_key_col {
         column_id view_col_id;
         regular_column_transformation::result before;
@@ -1267,10 +1188,10 @@ void view_updates::generate_update(
                         existing ? c->compute_value(*_base, base_key, *existing) : regular_column_transformation::result(),
                         c->compute_value(*_base, base_key, update));
                 } else {
-                    // We assume this a collection_column_computation used
-                    // just in secondary index of collection columns, and
-                    // we have a special code path to handle this case.
-                    // TODO: clean up this mess.
+                    // The only other column_computation we have which has
+                    // depends_on_non_primary_key_column is
+                    // collection_column_computation, and we have a special
+                    // function to handle that case:
                     return update_entry_for_computed_column(base_key, update, existing, now);
                 }
             }
@@ -1291,11 +1212,6 @@ void view_updates::generate_update(
             // versa).
             if (base_col->kind == update.column_kind()) {
                 // This is view key, so we know it is atomic
-                // TODO: according to the old code, it seems that if the update is a
-                // regular row we only need to look at the regular columns in the base,
-                // if the update is a static row we only need to check for base static
-                // rows. So if we cache this, we need to cache two verison - like
-                // we had base_regular/static_columns_in_view_pk. But I don't understand why.
                 std::optional<atomic_cell_view> after;
                 auto afterp = update.cells().find_cell(base_col->id);
                 if (afterp) {
@@ -1314,18 +1230,18 @@ void view_updates::generate_update(
             }
         }
     }
-    // The view has a non-primary-key column from the base table as its primary key.
-    // That means it's either a regular or static column. If we are currently
-    // processing an update which does not correspond to the column's kind,
-    // just stop here.
+    // If we reached here, the view has a non-primary-key column from the base
+    // table as its primary key. That means it's either a regular or static
+    // column. If we are currently processing an update which does not
+    // correspond to the column's kind, updatable_view_key_cols will be empty
+    // and we can just stop here.
     if (updatable_view_key_cols.empty()) {
         return;
     }
 
     // Use updatable_view_key_cols - the before and after values of the
-    // view key columns that may have changed, to determine if the update
-    // changes an existing view row (same_row) or deletes an old row
-    // and/or creates a new row.
+    // view key columns that may have changed - to determine if the update
+    // changes an existing view row, deletes an old row or creates a new row.
     bool has_old_row = true;
     bool has_new_row = true;
     bool same_row = true; // undefined if either has_old_row or has_new_row are false
@@ -1346,9 +1262,9 @@ void view_updates::generate_update(
         }
     }
 
-    // Calculate new_row_ts, only if has_new_row. This is the logic that used
-    // to be in compute_row_marker() and is no longer used.
-    // TODO: may need to also have ttl, not just ts, so perahps have new_row_marker that has both.
+    // If has_new_row, calculate a row marker for this view row - i.e., a
+    // timestamp and ttl - based on those of the updatable view key column
+    // (or, in an Alternator-only extension, more than one).
     row_marker new_row_rm; // only set if has_new_row
     if (has_new_row) {
         // Note:
@@ -1356,12 +1272,12 @@ void view_updates::generate_update(
         //    least one member (in CQL, it's always one, in Alternator it
         //    may be two).
         // 2. Because has_new_row, we know all elements in that array have
-        //    after.has_value() true, so we can use after.get_ts().
+        //    after.has_value() true, so we can use after.get_ts() et al.
         api::timestamp_type new_row_ts = updatable_view_key_cols[0].after.get_ts();
+        // This is the Alternator-only support for *two* regular base columns
+        // that become view key columns. The timestamp we use is the *maximum*
+        // of the two key columns, as explained in pull-request #17172.
         if (updatable_view_key_cols.size() > 1) {
-            // This is the Alternator-only support for two regular base
-            // columns that become view key columns. See explanation in
-            // view_updates::compute_row_marker().
             auto second_ts = updatable_view_key_cols[1].after.get_ts();
             new_row_ts = std::max(new_row_ts, second_ts);
             // Alternator isn't supposed to have more than two updatable view key columns!
@@ -1373,22 +1289,14 @@ void view_updates::generate_update(
         // (the only situation allowed in CQL) or if there is more then one
         // they have the same expiry information (in Alternator, there is
         // never a CQL TTL set).
-        // CONTINUE HERE: we need updatable_view_key_cols[0] to also cary the ttl() and expiry()! I.e., regular_column_transformation::result needs to contain ttl() and expiry()...
         new_row_rm =  row_marker(new_row_ts, updatable_view_key_cols[0].after.get_ttl(), updatable_view_key_cols[0].after.get_expiry());
     }
 
     if (has_old_row) {
-        // We should pass updateable_view_key_cols to the delete_old_entry()
-        // and the rest of the functions below so they won't need to calculate
-        // the computed columns again. But until we do that, we must at least
-        // calculate the correct timestamp for a delete_old_entry.
         // As explained in #19977, when there is one updatable_view_key_cols
         // (the only case allowed in CQL) the deletion timestamp is before's
         // timestamp. As explained in #17119, if there are two of them (only
         // possible in Alternator), we take the maximum.
-        // This repeats the logic we have also in do_delete_old_row(), and should
-        // be only here.
-
         // Note:
         // 1. By reaching here we know that updatable_view_key_cols has at
         //    least one member (in CQL, it's always one, in Alternator it
@@ -1411,13 +1319,11 @@ void view_updates::generate_update(
             if (same_row) {
                 update_entry(db, base_key, update, *existing, now, new_row_rm);
             } else {
-                // This code doesn't work if the old and new view row have the
-                // same key, because if they do we get both data and tombstone
-                // for the same timestamp (now) and the tombstone wins. This
-                // is why we need the "same_row" case above - it's not just a
-                // performance optimization.
-                // NYH: until we pass the entire updatable_view_key_cols we
-                // need to pass the ts.
+                // The following code doesn't work if the old and new view row
+                // have the same key, because if they do we can get both data
+                // and tombstone for the same timestamp and the tombstone
+                // wins. This is why we need the "same_row" case above - it's
+                // not just a performance optimization.
                 delete_old_entry(db, base_key, *existing, update, now, old_row_ts);
                 create_entry(db, base_key, update, now, new_row_rm);
             }
