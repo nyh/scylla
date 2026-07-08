@@ -716,6 +716,7 @@ perf_tests = set([
 
 perf_standalone_tests = set([
      'test/perf/perf_generic_server',
+     'test/perf/perf_http_shard_balance',
 ])
 
 raft_tests = set([

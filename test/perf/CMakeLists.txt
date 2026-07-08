@@ -98,6 +98,7 @@ add_perf_test(perf_s3_client
   LIBRARIES
     JsonCpp::JsonCpp)
 add_perf_test(perf_sort_by_proximity)
+add_perf_test(perf_http_shard_balance)
 add_perf_test(perf_bti_key_translation
   LIBRARIES
     dht
