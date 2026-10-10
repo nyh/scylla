@@ -568,11 +568,16 @@ def testUserTypeDrop(cql):
 @pytest.mark.xfail(reason="SCYLLADB-5171")
 def testDuplicateArgNames(cql, test_keyspace):
     KEYSPACE = test_keyspace
-    assert_invalid_message(cql, KEYSPACE, "Duplicate argument names for given function",
-                           "CREATE OR REPLACE FUNCTION " + KEYSPACE + ".scrinv(input double, input int) " +
-                           "CALLED ON NULL INPUT " +
-                           "RETURNS double " +
-                           java_or_lua(cql, "return Math.max(input, input)", "return input") + ";")
+    try:
+        assert_invalid_message(cql, KEYSPACE, "Duplicate argument names for given function",
+                               "CREATE OR REPLACE FUNCTION " + KEYSPACE + ".scrinv(input double, input int) " +
+                               "CALLED ON NULL INPUT " +
+                               "RETURNS double " +
+                               java_or_lua(cql, "return Math.max(input, input)", "return input") + ";")
+    finally:
+        # If the CREATE FUNCTION wrongly succeeded, don't leave the function
+        # behind in the shared test_keyspace, where it breaks other tests.
+        cql.execute("DROP FUNCTION IF EXISTS " + KEYSPACE + ".scrinv")
 
 # Reproduces SCYLLADB-5169 (CREATE OR REPLACE FUNCTION should not change the
 # return type or null-input behavior)
