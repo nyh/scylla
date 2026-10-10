@@ -640,7 +640,8 @@ public:
     ensure_result ensure_entry_in_latest() {
         auto&& rows = _snp.version()->partition().mutable_clustered_rows();
         if (is_in_latest_version()) {
-            auto latest_i = get_iterator_in_latest_version();
+            // Not get_iterator_in_latest_version(), which is unreliable in reversed mode.
+            auto latest_i = _current_row[0].it;
             rows_entry& latest = *latest_i;
             if (_snp.at_latest_version()) {
                 _snp.tracker()->touch(latest);

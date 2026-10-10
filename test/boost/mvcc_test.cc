@@ -1665,6 +1665,47 @@ SEASTAR_TEST_CASE(test_ensure_entry_in_latest_does_not_set_continuity_in_reverse
     });
 }
 
+// When a reversed cursor is positioned at a key which has no entry, it moves
+// to the preceding entry in table order. ensure_entry_in_latest() must then
+// return that entry, not the following one.
+SEASTAR_TEST_CASE(test_ensure_entry_in_latest_in_reversed_mode_after_missing_key) {
+    return seastar::async([] {
+        cache_tracker tracker;
+        auto& r = tracker.region();
+        with_allocator(r.allocator(), [&] {
+            simple_schema table;
+            auto&& s = *table.schema();
+
+            auto e = partition_entry::make_evictable(s, mutation_partition(s));
+            auto snap = e.read(r, tracker.cleaner(), &tracker);
+
+            {
+                auto&& p = snap->version()->partition();
+                p.clustered_row(s, table.make_ckey(1), is_dummy::no, is_continuous::yes);
+                p.clustered_row(s, table.make_ckey(3), is_dummy::no, is_continuous::yes);
+                p.clustered_row(s, table.make_ckey(5), is_dummy::no, is_continuous::yes);
+                p.ensure_last_dummy(s);
+            }
+
+            auto rev_s = s.make_reversed();
+            partition_snapshot_row_cursor cur(*rev_s, *snap, false, true);
+            position_in_partition::equal_compare eq(s);
+
+            {
+                logalloc::reclaim_lock rl(r);
+                BOOST_REQUIRE(cur.maybe_advance_to(table.make_ckey(4)));
+                BOOST_REQUIRE(eq(cur.table_position(), table.make_ckey(3)));
+
+                auto res = cur.ensure_entry_in_latest();
+                BOOST_REQUIRE(!res.inserted);
+                BOOST_REQUIRE(eq(res.row.position(), table.make_ckey(3)));
+                BOOST_REQUIRE(eq(res.it->position(), table.make_ckey(3)));
+            }
+            e.evict(tracker.cleaner());
+        });
+    });
+}
+
 SEASTAR_TEST_CASE(test_apply_is_atomic) {
     auto do_test = [](auto&& gen) {
         logalloc::region r;
