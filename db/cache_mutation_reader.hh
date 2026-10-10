@@ -828,9 +828,11 @@ void cache_mutation_reader::copy_from_cache_to_buffer() {
                     return (tomb && tomb.deletion_time < get_gc_before());
                 };
 
-                auto latests_range_tomb = _next_row.get_iterator_in_latest_version()->range_tombstone();
-                if (tomb_expired(latests_range_tomb)) {
-                    _next_row.get_iterator_in_latest_version()->set_range_tombstone({});
+                // Use latest_entry(), not get_iterator_in_latest_version(), which in
+                // reversed mode may point to a neighbor of the current row.
+                rows_entry& latest_entry = _next_row.latest_entry();
+                if (tomb_expired(latest_entry.range_tombstone())) {
+                    latest_entry.set_range_tombstone({});
                 }
             }
         }

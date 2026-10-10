@@ -133,8 +133,12 @@ class partition_snapshot_row_cursor final {
     // is the lower_bound() of the current position in table schema order.
     // For _reversed cursors it can be either lower_bound() in table order
     // or lower_bound() in cursor's order, so should not be relied upon.
-    // if current entry is in the latest version then _latest_it points to it,
-    // also in _reversed mode.
+    // If current entry is in the latest version then _latest_it points to it,
+    // but not necessarily in _reversed mode: There, after positioning the
+    // cursor at a position which isn't an entry in the latest version,
+    // _latest_it may point to the entry following the current one in table
+    // order, until the latest version's iterator is advanced. Use
+    // latest_entry() to get the current entry.
     std::optional<mutation_partition::rows_type::iterator> _latest_it;
 
     // Continuity and range tombstone corresponding to ranges which are not represented in _heap because the cursor
@@ -379,7 +383,8 @@ public:
         , _position(position_in_partition::static_row_tag_t{})
     { }
 
-    // If is_in_latest_version() then this returns an iterator to the entry under cursor in the latest version.
+    // If is_in_latest_version() then this returns an iterator to the entry under cursor in the latest version,
+    // but not necessarily in reversed mode (see _latest_it). Use latest_entry() to get the entry under cursor.
     mutation_partition::rows_type::iterator get_iterator_in_latest_version() const {
         SCYLLA_ASSERT(_latest_it);
         return *_latest_it;
@@ -583,6 +588,13 @@ public:
     // Can be called only when cursor is valid and pointing at a row.
     deletable_row& latest_row() const noexcept {
         return _current_row[0].it->row();
+    }
+
+    // Returns the entry of the current row in the most recent version which has it.
+    // Unlike get_iterator_in_latest_version(), this is reliable also in reversed mode.
+    // Can be called only when cursor is valid and pointing at a row.
+    rows_entry& latest_entry() const noexcept {
+        return *_current_row[0].it;
     }
 
     // Can be called only when cursor is valid and pointing at a row.
