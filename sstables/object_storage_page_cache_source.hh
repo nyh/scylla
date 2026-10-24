@@ -22,6 +22,7 @@
 #include "sstables/object_storage_page_cache_geometry.hh"
 #include "sstables/types.hh"
 #include "sstables/types_fwd.hh"
+#include "reader_permit.hh"
 #include "seastarx.hh"
 
 namespace sstables {
@@ -81,5 +82,14 @@ data_source make_page_cached_source(object_storage_page_cache& cache, sstable_id
         shared_ptr<const page_geometry> geometry, uint64_t offset, uint64_t length,
         object_storage_range_reader read_range, populate_disk_cache populate,
         lw_shared_ptr<object_storage_page_cache_table_stats> table_stats = {});
+
+// Returns a data_source which returns the buffers of the given source, with
+// their memory tracked by a read's permit - as reading through the read's
+// tracked file would (see make_tracked_file()). The memory is consumed
+// without waiting (reader_permit::consume_memory()): a read through the page
+// cache must not wait for memory while it holds buffers, which could stall
+// the reads of its semaphore - but its semaphore counts the memory, when it
+// decides whether to admit other reads, or to make them wait for memory.
+data_source make_permit_tracked_source(data_source source, reader_permit permit);
 
 } // namespace sstables

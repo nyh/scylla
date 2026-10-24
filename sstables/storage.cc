@@ -106,7 +106,7 @@ public:
     virtual future<file> open_component(const sstable& sst, component_type type, open_flags flags, file_open_options options, bool check_integrity) override;
     virtual future<data_sink> make_data_or_index_sink(sstable& sst, component_type type) override;
     future<data_source> make_data_or_index_source(sstable& sst, component_type type, file f, uint64_t offset, uint64_t len, file_input_stream_options opt,
-            populate_disk_cache populate) const override;
+            populate_disk_cache populate, reader_permit permit) const override;
     future<data_source> make_source(sstable& sst, component_type type, file f, uint64_t offset, uint64_t len, file_input_stream_options opt) const override;
     virtual future<data_sink> make_component_sink(sstable& sst, component_type type, open_flags oflags, file_output_stream_options options) override;
     virtual future<> destroy(const sstable& sst) override { return make_ready_future<>(); }
@@ -157,7 +157,7 @@ future<data_sink> filesystem_storage::make_data_or_index_sink(sstable& sst, comp
 }
 
 future<data_source> filesystem_storage::make_data_or_index_source(sstable& sst, component_type type, file f, uint64_t offset, uint64_t len, file_input_stream_options opt,
-        populate_disk_cache) const {
+        populate_disk_cache, reader_permit) const {
     SCYLLA_ASSERT(type == component_type::Data || type == component_type::Index);
     co_return co_await make_source(sst, type, std::move(f), offset, len, std::move(opt));
 }
@@ -742,7 +742,7 @@ protected:
     // through the object storage page cache - or nothing, if it should not be
     // read through the cache.
     future<std::optional<data_source>> maybe_make_page_cached_source(const sstable& sst, component_type type, uint64_t offset, uint64_t len,
-            populate_disk_cache populate) const;
+            populate_disk_cache populate, reader_permit permit) const;
 public:
     object_storage_base(sstring type, schema_ptr schema, shared_ptr<sstables::object_storage_client> client, sstring bucket, std::optional<sstring> loc, data_dictionary::storage_options::object_storage_layout layout, seastar::abort_source* as,
             data_dictionary::storage_options::disk_cache_mode disk_cache)
@@ -770,7 +770,7 @@ public:
     future<std::optional<file>> open_non_populating_component(const sstable& sst, component_type type) override;
     future<data_sink> make_data_or_index_sink(sstable& sst, component_type type) override;
     future<data_source> make_data_or_index_source(sstable& sst, component_type type, file f, uint64_t offset, uint64_t len, file_input_stream_options opt,
-            populate_disk_cache populate) const override;
+            populate_disk_cache populate, reader_permit permit) const override;
     future<data_source> make_source(sstable& sst, component_type type, file, uint64_t offset, uint64_t len, file_input_stream_options) const override;
 
     future<data_sink> make_component_sink(sstable& sst, component_type type, open_flags oflags, file_output_stream_options options) override;
@@ -865,7 +865,7 @@ public:
     {}
 
     future<data_source> make_data_or_index_source(sstable& sst, component_type type, file f, uint64_t offset, uint64_t len, file_input_stream_options opt,
-            populate_disk_cache populate) const override;
+            populate_disk_cache populate, reader_permit permit) const override;
     future<data_source> make_source(sstable& sst, component_type type, file f, uint64_t offset, uint64_t len, file_input_stream_options opt) const override;
 };
 
@@ -1095,7 +1095,7 @@ static data_source make_cached_object_source(shared_ptr<object_storage_page_cach
 
 future<std::optional<data_source>>
 object_storage_base::maybe_make_page_cached_source(const sstable& sst, component_type type, uint64_t offset, uint64_t len,
-        populate_disk_cache populate) const {
+        populate_disk_cache populate, reader_permit permit) const {
     // Besides Data, the older Index component is also sometimes read through a
     // data_source rather than through its file (see open_component()).
     if (_disk_cache != data_dictionary::storage_options::disk_cache_mode::pages
@@ -1151,8 +1151,9 @@ object_storage_base::maybe_make_page_cached_source(const sstable& sst, component
             // The extension can't read a range of the component through the
             // cache, so the component is read without it.
             cache->get_stats().transform_bypasses++;
+            co_return std::nullopt;
         }
-        co_return src;
+        co_return make_permit_tracked_source(std::move(*src), std::move(permit));
     }
     shared_ptr<const page_geometry> geometry;
     if (type == component_type::Index) {
@@ -1164,14 +1165,14 @@ object_storage_base::maybe_make_page_cached_source(const sstable& sst, component
     } else {
         geometry = make_shared<fixed_size_page_geometry>(sst.ondisk_data_size());
     }
-    co_return make_cached_object_source(std::move(cache), sid, type, std::move(geometry), offset, len,
-            _client, make_object_name(sst, type), abort_source(), populate, std::move(table_stats));
+    co_return make_permit_tracked_source(make_cached_object_source(std::move(cache), sid, type, std::move(geometry), offset, len,
+            _client, make_object_name(sst, type), abort_source(), populate, std::move(table_stats)), std::move(permit));
 }
 
 future<data_source>
 object_storage_base::make_data_or_index_source(sstable& sst, component_type type, file f, uint64_t offset, uint64_t len, file_input_stream_options options,
-        populate_disk_cache populate) const {
-    if (auto src = co_await maybe_make_page_cached_source(sst, type, offset, len, populate)) {
+        populate_disk_cache populate, reader_permit permit) const {
+    if (auto src = co_await maybe_make_page_cached_source(sst, type, offset, len, populate, std::move(permit))) {
         co_return std::move(*src);
     }
     co_return co_await make_source(sst, type, f, offset, len, options);
@@ -1184,8 +1185,8 @@ object_storage_base::make_source(sstable& sst, component_type type, file f, uint
 
 future<data_source>
 s3_storage::make_data_or_index_source(sstable& sst, component_type type, file f, uint64_t offset, uint64_t len, file_input_stream_options options,
-        populate_disk_cache populate) const {
-    if (auto src = co_await maybe_make_page_cached_source(sst, type, offset, len, populate)) {
+        populate_disk_cache populate, reader_permit permit) const {
+    if (auto src = co_await maybe_make_page_cached_source(sst, type, offset, len, populate, std::move(permit))) {
         co_return std::move(*src);
     }
     co_return co_await make_source(sst, type, std::move(f), offset, len, std::move(options));
