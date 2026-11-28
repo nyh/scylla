@@ -5006,6 +5006,8 @@ private:
             attribute_collector& modified_attrs, bool& any_updates, bool& any_deletes) const;
     void apply_update_expression(const std::unique_ptr<rjson::value>& previous_item, const api::timestamp_type ts, deletable_row& row,
             attribute_collector& modified_attrs, bool& any_updates, bool& any_deletes) const;
+    void rewrite_expiration(const rjson::value& previous_item, const api::timestamp_type ts, deletable_row& row,
+            attribute_collector& modified_attrs) const;
 };
 
 update_item_operation::update_item_operation(parsed::expression_cache& parsed_expression_cache, service::storage_proxy& proxy, rjson::value&& update_info)
@@ -5553,6 +5555,45 @@ inline void update_item_operation::apply_update_expression(const std::unique_ptr
     }
 }
 
+// The TTL expiration service may be deleting the item that this update read,
+// if it found the item expired. If this update's write ends up with a newer
+// timestamp than the deletion's tombstone, only the attributes it writes
+// survive the deletion, and if they don't include the expiration-time
+// attribute, the item comes back without it, and never expires again. So this
+// function also writes the expiration-time attribute, with its unchanged
+// value: whatever survives of the item then keeps the expiration time that
+// this update read, and if that has passed, the next scan deletes it.
+// This is done even if the item this update read hasn't expired: the service
+// may have found it expired before a write which moved its expiration time to
+// the future, and the deletion may delete that write too. The extra write
+// costs one cell, only in an update which read the item anyway.
+void update_item_operation::rewrite_expiration(const rjson::value& previous_item, const api::timestamp_type ts, deletable_row& row,
+        attribute_collector& modified_attrs) const {
+    std::optional<std::string> ttl_attribute = db::find_tag(*_schema, TTL_TAG_KEY);
+    if (!ttl_attribute) {
+        return;
+    }
+    // If the update writes or removes the expiration-time attribute itself,
+    // the item expires according to what the update does with it.
+    if (_update_expression.contains(*ttl_attribute) || (_attribute_updates && rjson::find(*_attribute_updates, *ttl_attribute))) {
+        return;
+    }
+    const rjson::value* expiration_time = rjson::find(previous_item, *ttl_attribute);
+    if (!expiration_time) {
+        return;
+    }
+    bytes column_name = to_bytes(*ttl_attribute);
+    const column_definition* cdef = find_attribute(*_schema, column_name);
+    if (cdef) {
+        // A key attribute is part of the item's key, so it can't be lost.
+        if (!cdef->is_primary_key()) {
+            row.cells().apply(*cdef, atomic_cell::make_live(*cdef->type, ts, get_key_from_typed_value(*expiration_time, *cdef)));
+        }
+    } else {
+        modified_attrs.put(std::move(column_name), serialize_item(*expiration_time), ts);
+    }
+}
+
 std::optional<mutation> update_item_operation::apply(std::unique_ptr<rjson::value> previous_item, api::timestamp_type ts, cdc::per_request_options& cdc_opts) const {
     if (_consumed_capacity._total_bytes == 0) {
         _consumed_capacity._total_bytes = 1;
@@ -5599,6 +5640,14 @@ std::optional<mutation> update_item_operation::apply(std::unique_ptr<rjson::valu
     }
     if (_attribute_updates) {
         apply_attribute_updates(previous_item, ts, row, modified_attrs, any_updates, any_deletes);
+    }
+    // Any update which writes a row marker (see below) - that is, anything
+    // but an update which only deletes attributes - can bring the item back
+    // to life when the item is deleted by its expiration, so it needs to keep
+    // the item's expiration time. An update which only deletes attributes
+    // writes nothing that can survive as an item.
+    if (previous_item && (any_updates || !any_deletes)) {
+        rewrite_expiration(*previous_item, ts, row, modified_attrs);
     }
     if (!modified_attrs.empty()) {
         auto serialized_map = modified_attrs.to_mut();
